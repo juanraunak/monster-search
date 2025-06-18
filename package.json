@@ -14,7 +14,8 @@
     "axios": "^1.10.0",
     "cheerio": "^1.1.0",
     "dotenv": "^16.5.0",
-    "gpt-tokenizer": "^3.0.1"
+    "gpt-tokenizer": "^3.0.1",
+    "youtube-sr": "^4.3.11"
   },
   "devDependencies": {
     "@types/dotenv": "^6.1.1",

@@ -3,6 +3,8 @@ import * as cheerio from 'cheerio';
 import * as fs from 'fs/promises';
 import * as readline from 'readline';
 import { encode } from 'gpt-tokenizer';
+import { YouTube } from 'youtube-sr';
+
 // For sentence transformers equivalent, we'll use a simple similarity function
 // For concurrent operations, we'll use Promise.allSettled
 // For fuzzy matching, we'll implement a simple version
@@ -471,33 +473,6 @@ function convert_course_to_json(course_content: string): CourseJson {
 }
 
 // === YouTube Search Functions ===
-async function get_video_durations(video_ids: string[], api_key: string): Promise<Record<string, number>> {
-    const params = new URLSearchParams({
-        part: "contentDetails",
-        id: video_ids.join(","),
-        key: api_key
-    });
-    const url = `https://www.googleapis.com/youtube/v3/videos?${params}`;
-    
-    const response = await axios.get(url);
-    const durations: Record<string, number> = {};
-    
-    for (const item of response.data.items) {
-        const video_id = item.id;
-        const duration_str = item.contentDetails.duration;
-        // Parse ISO 8601 duration (e.g., PT45S, PT1M30S, PT2M)
-        let seconds = 0;
-        const m = duration_str.match(/PT(?:(\d+)M)?(?:(\d+)S)?/);
-        if (m) {
-            const minutes = m[1] ? parseInt(m[1]) : 0;
-            const secs = m[2] ? parseInt(m[2]) : 0;
-            seconds = minutes * 60 + secs;
-        }
-        durations[video_id] = seconds;
-    }
-    return durations;
-}
-
 // Simple fuzzy matching function (equivalent to fuzzywuzzy)
 function fuzz_partial_token_sort_ratio(str1: string, str2: string): number {
     const normalize = (s: string) => s.toLowerCase().replace(/[^\w\s]/g, '').trim();
@@ -522,39 +497,20 @@ function fuzz_partial_token_sort_ratio(str1: string, str2: string): number {
     return Math.round((matches / Math.max(words1.length, words2.length)) * 100);
 }
 
-async function search_youtube_videos(topic: string, subtopic: string, max_results: number, api_key: string): Promise<VideoResult[]> {
-    const query = `${subtopic} ${topic}`;  // Subtopic first
+async function search_youtube_videos(topic: string, subtopic: string, max_results: number): Promise<VideoResult[]> {
+    const query = `${subtopic} ${topic}`;
     console.log(`\n🔍 Searching YouTube for: '${query}'`);
-    
-    const search_params = new URLSearchParams({
-        q: query,
-        part: "snippet",
-        type: "video",
-        maxResults: (max_results * 3).toString(),
-        regionCode: "US",               // Prefer US-based content
-        relevanceLanguage: "en",        // Prefer English content
-        key: api_key
-    });
-    const search_url = `https://www.googleapis.com/youtube/v3/search?${search_params}`;
-    
-    const response = await axios.get(search_url);
-    
-    const video_ids = response.data.items.map((item: any) => item.id.videoId);
-    const durations = await get_video_durations(video_ids, api_key);
-    
+    const results = await YouTube.search(query, { type: "video", limit: 30 });
+
     const videos: VideoResult[] = [];
-    for (const item of response.data.items) {
-        const video_id = item.id.videoId;
-        if ((durations[video_id] || 9999) < 60) {
+    for (const video of results) {
+        if (!video.duration || video.duration < 60) {
             continue;  // Skip Shorts
         }
-        
-        const title = item.snippet.title;
-        const channel = item.snippet.channelTitle;
-        const published = item.snippet.publishedAt;
-        const url = `https://www.youtube.com/watch?v=${video_id}`;
-        
-        // Relevance scoring
+        const title = video.title || '';
+        const channel = video.channel?.name || '';
+        const published = video.uploadedAt || '';
+        const url = video.url;
         const score_topic = fuzz_partial_token_sort_ratio(topic.toLowerCase(), title.toLowerCase());
         const score_sub = fuzz_partial_token_sort_ratio(subtopic.toLowerCase(), title.toLowerCase());
         let match = 1;
@@ -567,20 +523,19 @@ async function search_youtube_videos(topic: string, subtopic: string, max_result
         } else if (score_topic > 50) {
             match = 2;
         }
-        
         videos.push({
-            title: title,
-            url: url,
-            channel: channel,
-            published: published,
-            match: match
+            title,
+            url,
+            channel,
+            published,
+            match
         });
     }
-    
     videos.sort((a, b) => {
         if (a.match !== b.match) return b.match - a.match;
         return a.title.localeCompare(b.title);
     });
+    
     return videos.slice(0, max_results);
 }
 
@@ -595,7 +550,7 @@ async function run_youtube_search(course_json: CourseJson): Promise<Record<strin
     
     for (const subtopic of subtopics) {
         console.log(`\n📚 Subtopic: ${subtopic}`);
-        const videos = await search_youtube_videos(topic, subtopic, Settings.MAX_RESULTS_PER_SUBTOPIC, Settings.YOUTUBE_API_KEY);
+        const videos = await search_youtube_videos(topic, subtopic, Settings.MAX_RESULTS_PER_SUBTOPIC);
         all_results[subtopic] = videos;
         
         for (let i = 0; i < videos.length; i++) {
@@ -607,6 +562,7 @@ async function run_youtube_search(course_json: CourseJson): Promise<Record<strin
     
     return all_results;
 }
+
 
 async function research_pipeline(topic: string, intent: string): Promise<[string, string]> {
     console.log(`\n${"=".repeat(50)}`);
