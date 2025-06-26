@@ -1,0 +1,2073 @@
+import axios from 'axios';
+import * as cheerio from 'cheerio';
+import * as readline from 'readline';
+import { encode } from 'gpt-tokenizer';
+import { YouTube } from 'youtube-sr';
+import { search } from 'googlethis';
+import * as dotenv from 'dotenv';
+import ytsr from 'ytsr';
+
+
+dotenv.config();
+
+// === Configuration ===
+class Settings {
+    // API Keys - MOVE TO ENVIRONMENT VARIABLES
+    static readonly GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || "AIzaSyDSzs48YYQsaJKQItxjXlHFe6TV3fnwEDc";
+    static readonly GOOGLE_CX = process.env.GOOGLE_CX || "f68b0977580bc455c";
+    static readonly YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || "";
+    static readonly AZURE_OPENAI_API_KEY = process.env.AZURE_OPENAI_API_KEY || "";
+    static readonly AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || "";
+    static readonly AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || "2024-06-01";
+    static readonly AZURE_OPENAI_DEPLOYMENT_ID = process.env.AZURE_OPENAI_DEPLOYMENT_ID || "gpt-4o";
+
+    // Multi-Agent Settings
+    static readonly MAX_CONCURRENT_REQUESTS = 3;
+    static readonly MIN_SUBTOPICS = 10;
+    static readonly MAX_SUBTOPICS = 25;
+    static readonly COMPLETENESS_THRESHOLD = 0.95;
+    static readonly WEBSITES_PER_QUERY = 5;
+    static readonly FOUNDATION_QUERIES = 8;
+
+    // Delays
+    static readonly DELAY_BETWEEN_SEARCH_QUERIES_MS = 2000;
+    static readonly DELAY_AFTER_API_ERROR_MS = 5000;
+    static readonly DELAY_BETWEEN_BATCH_FETCHES_MS = 1000;
+}
+
+// === Global Variables ===
+let total_prompt_tokens = 0;
+let total_completion_tokens = 0;
+
+
+interface YouTubeVideoData {
+  title: string;
+  url: string;
+  videoId: string;
+  duration: string;
+  views: number;
+  channel: string;
+  channelUrl: string;
+  uploaded: string;
+  thumbnail: string;
+  snippet: string;
+  query: string;
+}
+
+// Headers for API calls
+const headers = {
+    "Content-Type": "application/json",
+    "api-key": Settings.AZURE_OPENAI_API_KEY
+};
+
+// === Types ===
+interface ChatMessage {
+    role: 'system' | 'user' | 'assistant';
+    content: string;
+}
+
+interface ExtractedData {
+    topic: string;
+    intent: string;
+}
+
+interface PageSummary {
+    url: string;
+    content: string;
+    tokens: number;
+    score: number;
+}
+
+interface VideoResult {
+    title: string;
+    url: string;
+    channel: string;
+    published: string;
+    match: number;
+    duration: number;
+}
+
+interface FoundationResult {
+    summaries: PageSummary[];
+    totalPages: number;
+    avgScore: number;
+}
+
+interface ResourceResult {
+    content: string;
+    url: string;
+    type: 'article' | 'video';
+    score: number;
+    title?: string;
+    channel?: string;
+    duration?: number;
+}
+
+interface SubtopicWithResource {
+    subtopic: string;
+    resource: ResourceResult;
+    learningObjectives: string[];
+    estimatedTime: number;
+    difficulty: number;
+    prerequisites: string[];
+}
+
+interface CourseStructure {
+    topic: string;
+    intent: string;
+    totalUnits: number;
+    estimatedHours: number;
+    units: SubtopicWithResource[];
+    completenessScore: number;
+    processingTime: number;
+}
+
+// === Utility Functions ===
+function count_tokens_from_messages(messages: ChatMessage[], model: string = "gpt-4o"): number {
+    const tokens_per_message = 3;
+    let num_tokens = 0;
+    for (const message of messages) {
+        num_tokens += tokens_per_message;
+        for (const value of Object.values(message)) {
+            num_tokens += encode(String(value)).length;
+        }
+    }
+    num_tokens += 3;
+    return num_tokens;
+}
+
+async function azure_chat_completion(messages: ChatMessage[]): Promise<string> {
+    const url = `${Settings.AZURE_OPENAI_ENDPOINT}/openai/deployments/${Settings.AZURE_OPENAI_DEPLOYMENT_ID}/chat/completions?api-version=${Settings.AZURE_OPENAI_API_VERSION}`;
+
+    const prompt_tokens = count_tokens_from_messages(messages, "gpt-4o");
+
+    try {
+        const response = await axios.post(url, {
+            messages: messages,
+            temperature: 0.7,
+            max_tokens: 4000
+        }, { headers });
+
+        const content = response.data.choices[0].message.content;
+        const completion_tokens = encode(content).length;
+
+        total_prompt_tokens += prompt_tokens;
+        total_completion_tokens += completion_tokens;
+
+        console.log(`📏 Tokens - Prompt: ${prompt_tokens} | Completion: ${completion_tokens}`);
+        return content;
+    } catch (error: any) {
+        console.error(`❌ Azure OpenAI API Error: ${error.response?.data || error.message}`);
+        throw error;
+    }
+}
+
+async function executeInParallel<T, R>(
+    items: T[],
+    asyncFunction: (item: T) => Promise<R>,
+    concurrencyLimit: number = Settings.MAX_CONCURRENT_REQUESTS,
+    delayBetweenBatches: number = Settings.DELAY_BETWEEN_BATCH_FETCHES_MS
+): Promise<R[]> {
+    const results: R[] = new Array(items.length);
+    let index = 0;
+
+    while (index < items.length) {
+        const batch = items.slice(index, index + concurrencyLimit);
+        const batchPromises = batch.map(async (item, i) => {
+            try {
+                const result = await asyncFunction(item);
+                results[index + i] = result;
+            } catch (e) {
+                console.error(`Error processing item ${index + i}: ${e}`);
+                results[index + i] = null as R;
+            }
+        });
+        
+        await Promise.all(batchPromises);
+        index += concurrencyLimit;
+
+        if (index < items.length) {
+            await new Promise((resolve) => setTimeout(resolve, delayBetweenBatches));
+        }
+    }
+
+    return results;
+}
+
+// === AGENT 1: Intent Extraction Agent ===
+class IntentExtractionAgent {
+    async extract_intent(): Promise<ExtractedData | null> {
+        console.log("\n" + "=".repeat(60));
+        console.log("🤖 AGENT 1: INTENT EXTRACTION");
+        console.log("=".repeat(60));
+        console.log("Define what you want to learn and your learning approach.");
+        console.log("Type 'exit' to stop.\n");
+
+        const system_prompt: ChatMessage = {
+            role: "system",
+            content: `You are an Intent Extraction Agent. Extract learning intent in this format:
+
+{
+  "topic": "specific subject to learn",
+  "intent": "learning approach and current level"
+}
+
+Rules:
+- Ask SHORT questions to clarify topic and intent
+- "topic" = specific subject (e.g., "piano", "Python programming", "data science")
+- "intent" = learning approach + current level (e.g., "complete beginner wanting to build web apps", "intermediate pianist wanting to play jazz")
+
+When both are clear, output JSON and say "Intent extracted. Starting research...`
+        };
+
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
+
+        const askQuestion = (question: string): Promise<string> => {
+            return new Promise((resolve) => {
+                rl.question(question, (answer) => resolve(answer.trim()));
+            });
+        };
+
+        const messages: ChatMessage[] = [];
+
+        try {
+            let conversationCount = 0;
+            const maxConversationTurns = 10;
+
+            while (conversationCount < maxConversationTurns) {
+                const prompt = await askQuestion("You: ");
+                if (prompt.toLowerCase() === "exit") {
+                    console.log("👋 Goodbye!");
+                    return null;
+                }
+
+                messages.push({ role: "user", content: prompt });
+                process.stdout.write("Agent: ");
+
+                const response = await azure_chat_completion([system_prompt, ...messages.slice(-6)]);
+                console.log(response);
+
+                messages.push({ role: "assistant", content: response });
+
+                // Check for JSON extraction
+                if (response.includes("{") && response.includes("}")) {
+                    try {
+                        const jsonMatch = response.match(/\{[\s\S]*?\}/);
+                        if (jsonMatch) {
+                            const extracted = JSON.parse(jsonMatch[0]);
+                            
+                            if (extracted && extracted.topic && extracted.intent) {
+                                console.log(`\n✅ Successfully extracted learning intent:`);
+                                console.log(`   Topic: ${extracted.topic}`);
+                                console.log(`   Intent: ${extracted.intent}\n`);
+                                return extracted;
+                            }
+                        }
+                    } catch (e) {
+                        // Continue if JSON parsing fails
+                    }
+                }
+                
+                conversationCount++;
+                console.log("\n");
+            }
+
+            console.log("⚠️ Maximum conversation turns reached. Please try again with more specific information.");
+            return null;
+
+        } catch (error) {
+            console.error(`❌ Error in intent extraction: ${error}`);
+            return null;
+        } finally {
+            rl.close();
+        }
+    }
+}
+
+// === AGENT 2: Foundation Builder Agent ===
+// === AGENT 2: Foundation Builder Agent (Fully Parallel) ===
+class SSRFoundationAgent {
+    async google_search(query: string): Promise<string[]> {
+        console.log(`🔍 Searching: "${query}"`);
+        
+        const url = `https://www.googleapis.com/customsearch/v1?key=${Settings.GOOGLE_API_KEY}&cx=${Settings.GOOGLE_CX}&q=${encodeURIComponent(query)}`;
+
+        try {
+            const response = await axios.get(url, { timeout: 15000 });
+            const results = response.data.items || [];
+            const urls = results.slice(0, Settings.WEBSITES_PER_QUERY).map((item: any) => item.link);
+            console.log(`   Found ${urls.length} URLs`);
+            return urls;
+        } catch (error: any) {
+            console.error(`❌ Search failed for "${query}": ${error.response?.data?.error?.message || error.message}`);
+            if (error.response && error.response.status === 429) {
+                console.error(`Rate limit hit. Waiting ${Settings.DELAY_AFTER_API_ERROR_MS / 1000} seconds.`);
+                await new Promise(resolve => setTimeout(resolve, Settings.DELAY_AFTER_API_ERROR_MS));
+            }
+            return [];
+        }
+    }
+
+    async fetch_and_clean_page(url: string): Promise<string | null> {
+        try {
+            console.log(`🌐 Fetching: ${url}`);
+            const response = await axios.get(url, { 
+                timeout: 15000,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+            });
+            
+            const $ = cheerio.load(response.data);
+
+            // Remove unwanted elements
+            $('script, style, noscript, iframe, header, footer, nav, .ad, .advertisement, .sidebar').remove();
+
+            // Extract main content
+            let text = '';
+            const contentSelectors = ['main', 'article', '.content', '.post-content', '.entry-content', 'body'];
+            
+            for (const selector of contentSelectors) {
+                const content = $(selector).first();
+                if (content.length > 0) {
+                    text = content.text();
+                    break;
+                }
+            }
+            
+            if (!text) {
+                text = $('body').text();
+            }
+
+            // Clean and normalize text
+            text = text
+                .replace(/\s+/g, ' ')
+                .replace(/[^\w\s.,;:!?()-]/g, '')
+                .trim();
+
+            if (text.length < 500) {
+                console.log(`   ⚠️ Content too short (${text.length} chars), skipping`);
+                return null;
+            }
+
+            console.log(`   ✅ Extracted ${text.length} characters`);
+            return text.substring(0, 15000);
+        } catch (error: any) {
+            console.error(`❌ Failed to fetch/clean page ${url}: ${error.message}`);
+            return null;
+        }
+    }
+
+    async summarize_page(content: string, topic: string, intent: string): Promise<string | null> {
+        if (!content || content.length < 100) return null;
+
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `You are an expert Foundation Builder Agent specialized in extracting educational content.
+
+TASK: Create a focused, educational summary of the provided content that directly supports learning "${topic}" with the intent "${intent}".
+
+SUMMARY REQUIREMENTS:
+- Length: 200-300 words
+- Focus ONLY on content directly relevant to the learning topic and intent
+- Extract: core concepts, fundamental principles, key methods, practical applications, important terminology
+- Ignore: marketing content, ads, navigation text, author bios, unrelated topics
+- Write in clear, educational language suitable for someone learning this topic
+- Structure information logically (concepts → methods → applications)
+
+QUALITY FILTERS:
+- If content is mostly marketing/promotional, return "IRRELEVANT_CONTENT"
+- If content doesn't relate to the topic, return "OFF_TOPIC"
+- If content is too superficial, try to extract what's useful but note limitations
+
+Return ONLY the educational summary or the quality filter response.`
+            },
+            {
+                role: "user",
+                content: `Topic: ${topic}
+Intent: ${intent}
+
+Content to summarize:
+${content.substring(0, 12000)}`
+            }
+        ];
+
+        try {
+            const summary = await azure_chat_completion(messages);
+            
+            if (summary.includes("IRRELEVANT_CONTENT") || summary.includes("OFF_TOPIC")) {
+                console.log(`   ⚠️ Content filtered out as irrelevant`);
+                return null;
+            }
+            
+            console.log(`   ✅ Generated summary (${summary.length} chars)`);
+            return summary;
+        } catch (error) {
+            console.error(`❌ Failed to summarize content: ${error}`);
+            return null;
+        }
+    }
+
+    async generate_foundation_queries(topic: string, intent: string): Promise<string[]> {
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `You are a search query optimization expert for educational content discovery.
+
+TASK: Generate 6-8 strategic Google search queries to build comprehensive foundational knowledge.
+
+QUERY STRATEGY:
+1. Target high-quality, text-rich educational content (articles, guides, tutorials, academic resources)
+2. Avoid video-heavy platforms (YouTube, TikTok, Instagram)
+3. Focus on different aspects:
+   - Core concepts and fundamentals
+   - Practical methods and techniques
+   - Common challenges and solutions
+   - Real-world applications
+   - Best practices and frameworks
+   - Advanced techniques
+   - Industry standards
+
+QUERY REQUIREMENTS:
+- Length: 3-7 words each
+- Specific and targeted
+- Use terms that educational sites would likely contain
+- Include relevant technical terminology
+- Vary the angle of approach
+
+EXAMPLE GOOD QUERIES:
+- "machine learning fundamentals tutorial"
+- "python data science beginner guide"
+- "digital marketing strategy framework"
+- "classical piano technique exercises"
+
+Return ONLY the queries, one per line, no numbering or additional text.`
+            },
+            {
+                role: "user",
+                content: `Topic: "${topic}"
+Learning Intent: "${intent}"`
+            }
+        ];
+
+        try {
+            const response = await azure_chat_completion(messages);
+            const queries = response.split('\n')
+                .map(q => q.trim())
+                .filter(q => q.length > 0 && !q.match(/^\d+\./))
+                .slice(0, 8);
+            
+            console.log(`✅ Generated ${queries.length} foundation queries`);
+            return queries;
+        } catch (error) {
+            console.error(`❌ Failed to generate foundation queries: ${error}`);
+            return [
+                `${topic} fundamentals guide`,
+                `${topic} beginner tutorial`,
+                `${topic} best practices`,
+                `${topic} advanced techniques`
+            ];
+        }
+    }
+
+    // NEW: Parallel search execution with staggered delays
+    async execute_parallel_searches(queries: string[]): Promise<string[]> {
+        console.log(`🚀 Executing ${queries.length} searches in parallel with staggered delays...`);
+        
+        const searchPromises = queries.map(async (query, index) => {
+            // Stagger the requests to avoid hitting rate limits
+            const delay = index * (Settings.DELAY_BETWEEN_SEARCH_QUERIES_MS / queries.length);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            
+            try {
+                return await this.google_search(query);
+            } catch (error) {
+                console.error(`❌ Search failed for query ${index}: ${query}`);
+                return [];
+            }
+        });
+
+        const allResults = await Promise.all(searchPromises);
+        const allUrls = allResults.flat();
+        
+        // Remove duplicates
+        const uniqueUrls = [...new Set(allUrls)];
+        console.log(`🔗 Collected ${uniqueUrls.length} unique URLs from ${queries.length} parallel searches`);
+        
+        return uniqueUrls;
+    }
+
+    // NEW: Fully parallel content processing
+    async process_urls_in_parallel(
+        urls: string[],
+        topic: string,
+        intent: string
+    ): Promise<string[]> {
+        console.log(`🔄 Processing ${urls.length} URLs in parallel...`);
+        
+        const processingPromises = urls.map(async (url) => {
+            try {
+                // Fetch and clean content
+                const content = await this.fetch_and_clean_page(url);
+                if (!content) return null;
+                
+                // Generate summary
+                const summary = await this.summarize_page(content, topic, intent);
+                return summary;
+            } catch (error) {
+                console.error(`❌ Failed to process URL: ${url}`);
+                return null;
+            }
+        });
+
+        // Execute all processing in parallel with controlled concurrency
+        const results = await executeInParallel(
+            processingPromises,
+            async (promise) => await promise,
+            Settings.MAX_CONCURRENT_REQUESTS,
+            Settings.DELAY_BETWEEN_BATCH_FETCHES_MS
+        );
+
+        const validSummaries = results.filter((summary): summary is string => !!summary);
+        console.log(`✅ Successfully processed ${validSummaries.length}/${urls.length} URLs`);
+        
+        return validSummaries;
+    }
+
+    async build_topic_report(topic: string, intent: string): Promise<string> {
+        console.log(`\n${"=".repeat(60)}`);
+        console.log(`🕷️ SSR AGENT: BUILDING WEB OF TRUTH (FULLY PARALLEL)`);
+        console.log(`${"=".repeat(60)}`);
+
+        const startTime = Date.now();
+
+        // STEP 1: Generate foundation queries
+        const queries = await this.generate_foundation_queries(topic, intent);
+        if (queries.length === 0) {
+            console.error("❌ No foundation queries generated. Cannot build report.");
+            return "Unable to generate research queries for this topic.";
+        }
+        
+        console.log(`🔍 Foundation queries:`);
+        queries.forEach((q, i) => console.log(`   ${i + 1}. ${q}`));
+
+        // STEP 2: Execute all searches in parallel with staggered timing
+        const allUrls = await this.execute_parallel_searches(queries);
+        
+        if (allUrls.length === 0) {
+            console.error("❌ No URLs found from any search queries.");
+            return "No foundational content could be discovered for this topic.";
+        }
+
+        // STEP 3: Process all URLs in parallel
+        const allSummaries = await this.process_urls_in_parallel(allUrls, topic, intent);
+
+        const endTime = Date.now();
+        const processingTime = Math.round((endTime - startTime) / 1000);
+
+        console.log(`\n📈 PARALLEL PROCESSING RESULTS:`);
+        console.log(`   Total URLs processed: ${allUrls.length}`);
+        console.log(`   Successful summaries: ${allSummaries.length}`);
+        console.log(`   Success rate: ${Math.round((allSummaries.length / allUrls.length) * 100)}%`);
+        console.log(`   Total processing time: ${processingTime} seconds`);
+
+        if (allSummaries.length === 0) {
+            console.warn("❌ No summaries were successfully generated from any search queries.");
+            return "No foundational content could be gathered for this topic. This might be due to rate limits or the topic being too specialized.";
+        }
+
+        // STEP 4: Combine and synthesize all summaries
+        const combined = allSummaries.join("\n\n").substring(0, 15000);
+
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `You are an expert knowledge synthesizer and educational content architect.
+
+INPUT:
+A set of web-derived summaries or extracted content on a single topic, gathered through parallel processing.
+
+GOAL:
+Extract and organize only the **teachable knowledge** required to understand and master the topic. Output a structured "Web of Truth" report optimized for generating learning subtopics.
+
+RULES:
+- Use ONLY the information provided in the input.
+- DO NOT include behavior suggestions (e.g. "take classes", "get inspired").
+- DO NOT include tools, apps, or products unless they are core to a learning concept.
+- DO NOT include lifestyle, motivation, or emotional benefits unless essential to a concept.
+- FOCUS on structuring knowledge into concepts, techniques, relationships, and logical learning order.
+- EVERYTHING in the output should be a **teachable unit**, not an action or encouragement.
+
+OUTPUT FORMAT:
+
+# Web of Truth Report: [Topic Name]
+
+## 1. CORE FOUNDATIONS
+- Fundamental concepts and principles
+- Essential terminology and definitions
+- Basic building blocks
+
+✅ High confidence (multiple sources confirm)
+⚠️ Medium confidence (limited sources)
+❌ Low confidence (single source or unclear)
+
+## 2. KEY METHODOLOGIES
+- Primary approaches and techniques
+- Standard practices and conceptual frameworks
+- Foundational systems (if applicable)
+
+✅ / ⚠️ / ❌
+
+## 3. PRACTICAL APPLICATIONS
+- Real-world knowledge applications
+- Common domain-specific implementations
+- Patterns observed in expert practice
+
+✅ / ⚠️ / ❌
+
+## 4. LEARNING PATHWAYS
+- Logical progression of concepts
+- Prerequisite relationships
+- Skill or concept development sequence
+
+✅ / ⚠️ / ❌
+
+## 5. COMMON CHALLENGES
+- Frequent conceptual barriers
+- Misconceptions or faulty assumptions
+- Conceptual trouble zones and how to approach them
+
+✅ / ⚠️ / ❌
+
+STYLE:
+- Use clear, precise, instructional language.
+- Structure content hierarchically using lists and sublists.
+- No fluff, filler, or motivational commentary.
+- All output should support curriculum design and subtopic extraction.`
+            },
+            {
+                role: "user",
+                content: `Topic: "${topic}"
+Learning Intent: "${intent}"
+Number of sources analyzed: ${allSummaries.length}
+Processing method: Fully parallel execution
+
+Web-derived summaries:
+${combined}`
+            }
+        ];
+
+        try {
+            const finalReport = await azure_chat_completion(messages);
+            console.log(`✅ Web of Truth successfully constructed (${finalReport.length} characters)`);
+            console.log(`⚡ Total parallel processing completed in ${processingTime} seconds`);
+            return finalReport;
+        } catch (error) {
+            console.error(`❌ Failed to build final topic report: ${error}`);
+            return "Failed to synthesize gathered information into a coherent report.";
+        }
+    }
+}
+// === SPIDER KING (Advanced Subtopic Analysis) ===
+// === SPIDER KING (Advanced Subtopic Analysis) ===
+class SpiderKing {
+    async identify_subtopics_from_web_of_truth(
+        webOfTruth: string,
+        topic: string,
+        intent: string
+    ): Promise<{ title: string; summary: string }[]> {
+        console.log(`\n${"=".repeat(60)}`);
+        console.log(`🤴 SPIDER KING: ADVANCED SUBTOPIC DECOMPOSITION`);
+        console.log(`${"=".repeat(60)}`);
+
+        // STEP 1: Try to process the full Web of Truth first
+        console.log(`📏 Web of Truth length: ${webOfTruth.length} characters`);
+        
+        let subtopics: { title: string; summary: string }[] = [];
+        
+        // If the Web of Truth is reasonably sized, process it as a whole
+        if (webOfTruth.length <= 12000) {
+            console.log(`🔍 Processing Web of Truth as single unit...`);
+            subtopics = await this.run_spider_pass(webOfTruth, topic, intent, "COMPLETE");
+        } else {
+            // STEP 2: Split the Web of Truth into manageable parts
+            console.log(`🔪 Web of Truth too large, splitting into parts...`);
+            const [partA, partB] = this.splitWebOfTruth(webOfTruth);
+            
+            console.log(`   Part A: ${partA.length} characters`);
+            console.log(`   Part B: ${partB.length} characters`);
+
+            // STEP 3: Generate subtopics from both parts
+            const subtopicsA = await this.run_spider_pass(partA, topic, intent, "PART A");
+            const subtopicsB = await this.run_spider_pass(partB, topic, intent, "PART B");
+
+            // STEP 4: Combine and deduplicate
+            subtopics = this.combineAndDeduplicate([...subtopicsA, ...subtopicsB]);
+        }
+
+        console.log(`\n🧵 FINAL RESULT: ${subtopics.length} subtopics extracted`);
+        subtopics.forEach((s, i) => console.log(`   ${i + 1}. ${s.title}`));
+
+        if (subtopics.length < 8) {
+            console.warn(`⚠️ Only ${subtopics.length} subtopics extracted. This might indicate parsing issues.`);
+            console.warn(`   Consider checking the Web of Truth format or adjusting the extraction logic.`);
+        }
+
+        return subtopics;
+    }
+
+    private splitWebOfTruth(web: string): [string, string] {
+        // Try multiple split strategies
+        const splitPoints = [
+            "## 3. PRACTICAL APPLICATIONS",
+            "### 3. PRACTICAL APPLICATIONS", 
+            "# 3. PRACTICAL APPLICATIONS",
+            "3. PRACTICAL APPLICATIONS",
+            "## PRACTICAL APPLICATIONS",
+            "PRACTICAL APPLICATIONS"
+        ];
+
+        for (const splitPoint of splitPoints) {
+            const index = web.indexOf(splitPoint);
+            if (index > 0 && index < web.length * 0.8) { // Ensure reasonable split
+                console.log(`✂️ Splitting at: "${splitPoint}"`);
+                return [web.slice(0, index).trim(), web.slice(index).trim()];
+            }
+        }
+
+        // Fallback: intelligent content-aware split
+        console.warn("⚠️ No natural split point found, using intelligent split.");
+        return this.intelligentSplit(web);
+    }
+
+    private intelligentSplit(web: string): [string, string] {
+        const lines = web.split('\n');
+        const midPoint = Math.floor(lines.length / 2);
+        
+        // Look for a good break point near the middle (header or section break)
+        for (let i = midPoint - 10; i <= midPoint + 10; i++) {
+            if (i >= 0 && i < lines.length) {
+                const line = lines[i].trim();
+                if (line.startsWith('#') || line.startsWith('##') || line.length === 0) {
+                    const partA = lines.slice(0, i).join('\n').trim();
+                    const partB = lines.slice(i).join('\n').trim();
+                    console.log(`✂️ Intelligent split at line ${i}: "${line.substring(0, 50)}..."`);
+                    return [partA, partB];
+                }
+            }
+        }
+
+        // Ultimate fallback: split by character count
+        const mid = Math.floor(web.length / 2);
+        return [web.slice(0, mid), web.slice(mid)];
+    }
+
+    private combineAndDeduplicate(subtopics: { title: string; summary: string }[]): { title: string; summary: string }[] {
+        const seen = new Set<string>();
+        const unique: { title: string; summary: string }[] = [];
+
+        for (const subtopic of subtopics) {
+            const normalizedTitle = subtopic.title.toLowerCase().trim();
+            if (!seen.has(normalizedTitle) && subtopic.title.length > 5) {
+                seen.add(normalizedTitle);
+                unique.push(subtopic);
+            }
+        }
+
+        console.log(`🔄 Deduplicated ${subtopics.length} → ${unique.length} subtopics`);
+        return unique;
+    }
+
+    private async run_spider_pass(
+        webSection: string,
+        topic: string,
+        intent: string,
+        label: string
+    ): Promise<{ title: string; summary: string }[]> {
+        console.log(`\n🔍 Running Spider King on ${label}...`);
+        console.log(`   Input length: ${webSection.length} characters`);
+
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `You are the SPIDER KING — an elite AI architect specializing in learning curriculum design.
+
+**MISSION**: Analyze the provided "Web of Truth" report and extract 8-15 distinct, learnable subtopics that form a complete educational journey.
+
+**SUBTOPIC EXTRACTION RULES**:
+1. **DISTINCT**: Each subtopic must cover a unique aspect - no overlapping content
+2. **PROGRESSIVE**: Order from foundational concepts to advanced applications  
+3. **COMPREHENSIVE**: Together they must cover the complete topic scope
+4. **LEARNER-FOCUSED**: Everything must directly serve the stated learning intent
+5. **ACTIONABLE**: Each subtopic should represent a concrete learning milestone
+
+**REQUIRED OUTPUT FORMAT** (CRITICAL - Follow exactly):
+
+SUBTOPIC_START
+Title: [Clear, descriptive subtopic name]
+Summary: [Comprehensive 200-300 word explanation covering: 
+- What this subtopic teaches
+- Why it's important for mastering the main topic
+- How it fits in the learning progression
+- Key concepts and skills gained
+- Any prerequisites or connections to other subtopics
+- Practical applications or outcomes]
+SUBTOPIC_END
+
+SUBTOPIC_START
+Title: [Next subtopic name]
+Summary: [Next comprehensive summary]
+SUBTOPIC_END
+
+
+**CRITICAL REQUIREMENTS**:
+- Use EXACTLY the format above with SUBTOPIC_START and SUBTOPIC_END markers
+- Generate 8-15 subtopics minimum
+- Each summary must be 200-300 words
+- Maintain logical learning progression
+- Extract content ONLY from the provided Web of Truth
+- No marketing fluff or motivational content - pure educational value
+
+**EXTRACTION STRATEGY**:
+- Identify core concepts, methodologies, applications, and advanced techniques
+- Look for natural learning boundaries and skill-building opportunities
+- Consider prerequisite relationships and concept dependencies
+- Focus on teachable, measurable learning outcomes`
+            },
+            {
+                role: "user",
+                content: `**LEARNING CONTEXT**:
+Topic: "${topic}"
+Learning Intent: "${intent}"
+
+**WEB OF TRUTH REPORT TO ANALYZE**:
+${webSection}
+
+Please extract comprehensive learning subtopics using the exact format specified above. Focus on creating a complete learning journey that progresses logically from basics to mastery.`
+            }
+        ];
+
+        try {
+            const response = await azure_chat_completion(messages);
+            console.log(`📝 Spider King response length: ${response.length} characters`);
+            
+            // Enhanced parsing with better error handling
+            const subtopics = this.parseSubtopicsFromResponse(response);
+            
+            console.log(`✅ ${label} extracted ${subtopics.length} subtopics`);
+            
+            if (subtopics.length === 0) {
+                console.error(`❌ Failed to parse any subtopics from ${label} response`);
+                console.error(`Response preview: ${response.substring(0, 500)}...`);
+            }
+            
+            return subtopics;
+        } catch (error) {
+            console.error(`❌ ${label} failed: ${error}`);
+            return [];
+        }
+    }
+
+    private parseSubtopicsFromResponse(response: string): { title: string; summary: string }[] {
+        const subtopics: { title: string; summary: string }[] = [];
+        
+        // Method 1: Try the structured format with markers
+        const markerPattern = /SUBTOPIC_START\s*\n?Title:\s*(.+?)\s*\n?Summary:\s*([\s\S]*?)\s*SUBTOPIC_END/gi;
+        let match;
+        
+        while ((match = markerPattern.exec(response)) !== null) {
+            const title = match[1].trim();
+            const summary = match[2].trim();
+            
+            if (title && summary && summary.length > 50) {
+                subtopics.push({ title, summary });
+            }
+        }
+        
+        if (subtopics.length > 0) {
+            console.log(`✅ Parsed ${subtopics.length} subtopics using structured format`);
+            return subtopics;
+        }
+        
+        // Method 2: Fallback - look for Title/Summary patterns
+        console.log(`⚠️ Structured format failed, trying fallback parsing...`);
+        const fallbackPattern = /(?:^|\n)(?:Title|Subtopic):\s*(.+?)\s*\n(?:Summary):\s*([\s\S]*?)(?=\n(?:Title|Subtopic):|$)/gi;
+        
+        while ((match = fallbackPattern.exec(response)) !== null) {
+            const title = match[1].trim();
+            const summary = match[2].trim();
+            
+            if (title && summary && summary.length > 50) {
+                subtopics.push({ title, summary });
+            }
+        }
+        
+        if (subtopics.length > 0) {
+            console.log(`✅ Parsed ${subtopics.length} subtopics using fallback method`);
+            return subtopics;
+        }
+        
+        // Method 3: Last resort - split by sections and try to extract
+        console.log(`⚠️ All parsing methods failed, attempting manual extraction...`);
+        return this.manualExtractionFallback(response);
+    }
+    
+    private manualExtractionFallback(response: string): { title: string; summary: string }[] {
+        const subtopics: { title: string; summary: string }[] = [];
+        
+        // Split by likely section breaks
+        const sections = response.split(/\n\s*\n|\n(?=\d+\.|\*|#)/);
+        
+        for (const section of sections) {
+            const lines = section.trim().split('\n');
+            if (lines.length < 2) continue;
+            
+            const firstLine = lines[0].trim();
+            const restOfSection = lines.slice(1).join('\n').trim();
+            
+            // Look for title-like patterns
+            if (firstLine.length > 10 && firstLine.length < 100 && restOfSection.length > 100) {
+                // Clean up the title
+                const title = firstLine
+                    .replace(/^\d+\.\s*/, '')
+                    .replace(/^[-*]\s*/, '')
+                    .replace(/^#+\s*/, '')
+                    .replace(/Title:\s*/i, '')
+                    .replace(/Subtopic:\s*/i, '')
+                    .trim();
+                
+                const summary = restOfSection
+                    .replace(/^Summary:\s*/i, '')
+                    .trim();
+                
+                if (title && summary && summary.length > 50) {
+                    subtopics.push({ title, summary });
+                }
+            }
+        }
+        
+        console.log(`📋 Manual extraction found ${subtopics.length} potential subtopics`);
+        return subtopics;
+    }
+}
+
+// === INFO SPIDER AGENT (Deep Subtopic Investigation) ===
+class InfoSpiderAgent {
+    async investigate_subtopic(
+        subtopic: string,
+        topic: string,
+        intent: string
+    ): Promise<{ report: string; subtopic: string }> {
+        console.log(`\n🕷️ INFO SPIDER investigating: "${subtopic}"`);
+
+        // Generate targeted search queries
+        const queryPrompt: ChatMessage[] = [
+            {
+                role: "system",
+                content: `Generate 3 highly targeted Google search queries to deeply investigate this subtopic.
+
+QUERY STRATEGY:
+- Query 1: Focus on fundamentals and core concepts
+- Query 2: Target practical examples and tutorials  
+- Query 3: Look for advanced techniques and best practices
+
+REQUIREMENTS:
+- 4-8 words per query
+- Use specific technical terminology
+- Target educational content (tutorials, guides, documentation)
+- Avoid video platforms
+
+Return only the queries, one per line.`
+            },
+            {
+                role: "user",
+                content: `Subtopic: ${subtopic}
+Main Topic: ${topic}
+Learning Intent: ${intent}`
+            }
+        ];
+
+        try {
+            const queryResponse = await azure_chat_completion(queryPrompt);
+            const queries = queryResponse.split("\n").map(q => q.trim()).filter(Boolean).slice(0, 3);
+            
+            console.log(`🔍 Search queries: ${queries.join(" | ")}`);
+
+            // Collect URLs from all queries
+            const ssrAgent = new SSRFoundationAgent();
+            const allUrls: string[] = [];
+            
+            for (const query of queries) {
+                const urls = await ssrAgent.google_search(query);
+                allUrls.push(...urls);
+            }
+
+            // Remove duplicates
+            const uniqueUrls = [...new Set(allUrls)];
+            console.log(`🔗 Found ${uniqueUrls.length} unique URLs to investigate`);
+
+            // Scrape and process content
+            const scrapedContents = await executeInParallel(
+                uniqueUrls,
+                async (url) => {
+                    const content = await ssrAgent.fetch_and_clean_page(url);
+                    return { url, content };
+                },
+                Settings.MAX_CONCURRENT_REQUESTS,
+                Settings.DELAY_BETWEEN_BATCH_FETCHES_MS
+            );
+
+            // Filter and combine valid content
+            const validContents = scrapedContents
+                .filter(item => item && item.content && item.content.length > 200)
+                .map(item => `Source: ${item.url}\n${item.content}`)
+                .join("\n\n");
+
+            if (!validContents) {
+                console.log(`⚠️ No valid content found for subtopic: ${subtopic}`);
+                return {
+                    subtopic,
+                    report: `Unable to gather sufficient information about ${subtopic}. This may be a highly specialized or emerging topic.`
+                };
+            }
+
+            // Generate comprehensive report
+            const reportPrompt: ChatMessage[] = [
+                {
+                    role: "system",
+                    content: `You are an expert educational content synthesizer specializing in deep subtopic analysis.
+
+TASK: Create a comprehensive learning report for this subtopic using ONLY the provided web content.
+
+REPORT STRUCTURE:
+1. SUBTOPIC OVERVIEW (2-3 sentences)
+   - Clear definition and scope
+   - Relevance to main topic and learning intent
+
+2. CORE CONCEPTS (detailed explanation)
+   - Key principles and theories
+   - Important terminology
+   - Fundamental building blocks
+
+3. PRACTICAL METHODS (step-by-step approaches)
+   - Specific techniques and procedures
+   - Tools and technologies used
+   - Implementation strategies
+
+4. REAL-WORLD APPLICATIONS
+   - Industry use cases
+   - Common scenarios
+   - Practical examples
+
+5. LEARNING PROGRESSION
+   - Prerequisites needed
+   - Logical learning sequence
+   - Connection to other subtopics
+
+6. COMMON CHALLENGES
+   - Typical obstacles and pitfalls
+   - Misconceptions to avoid
+   - Troubleshooting approaches
+
+7. NEXT STEPS
+   - What to learn after mastering this
+   - Advanced concepts to explore
+   - Practical projects to attempt
+
+QUALITY REQUIREMENTS:
+- Use only information from the provided sources
+- Write in clear, educational language
+- Include specific examples and actionable advice
+- Maintain focus on the learner's intent
+- Ensure content is comprehensive but not overwhelming
+
+Length: 800-1200 words total`
+                },
+                {
+                    role: "user",
+                    content: `Subtopic: ${subtopic}
+Main Topic: ${topic}
+Learning Intent: ${intent}
+
+Web Sources Content:
+${validContents.substring(0, 12000)}`
+                }
+            ];
+
+            const report = await azure_chat_completion(reportPrompt);
+            console.log(`✅ Generated comprehensive report for: ${subtopic}`);
+            
+            return {
+                subtopic,
+                report
+            };
+
+        } catch (error) {
+            console.error(`❌ Failed to investigate subtopic "${subtopic}": ${error}`);
+            return {
+                subtopic,
+                report: `Investigation failed for ${subtopic}. Unable to gather sufficient information due to technical limitations.`
+            };
+        }
+    }
+
+    async investigate_all_subtopics(
+        subtopics: { title: string; summary: string }[],
+        topic: string,
+        intent: string
+    ): Promise<{ subtopic: string; report: string }[]> {
+        console.log(`\n${"=".repeat(60)}`);
+        console.log(`🕷️ INFO SPIDER AGENT: DEEP SUBTOPIC INVESTIGATION`);
+        console.log(`${"=".repeat(60)}`);
+        console.log(`🎯 Investigating ${subtopics.length} subtopics with ${Settings.MAX_CONCURRENT_REQUESTS} concurrent threads`);
+
+        const results = await executeInParallel(
+            subtopics,
+            async (subtopic) => await this.investigate_subtopic(subtopic.title, topic, intent),
+            Settings.MAX_CONCURRENT_REQUESTS,
+            Settings.DELAY_BETWEEN_BATCH_FETCHES_MS
+        );
+
+        const validResults = results.filter(r => r !== null);
+        console.log(`\n📊 Investigation Complete:`);
+        console.log(`   Subtopics processed: ${subtopics.length}`);
+        console.log(`   Successful investigations: ${validResults.length}`);
+        console.log(`   Success rate: ${Math.round((validResults.length / subtopics.length) * 100)}%`);
+
+        return validResults;
+    }
+}
+
+
+class YouTubeSpiderAgent {
+  async generate_search_queries(topic: string, subtopic: string): Promise<string[]> {
+    const messages: ChatMessage[] = [
+      {
+        role: 'system',
+        content: `You are a search query generator. Generate 5-6 diverse YouTube search queries for finding educational content.
+Output only a JSON array of strings, no other text.
+Make queries specific and varied to capture different angles of the topic.`
+      },
+      {
+        role: 'user',
+        content: `Topic: ${topic}
+Subtopic: ${subtopic}
+
+Generate 5-6 YouTube search queries that would find the best educational videos for this subtopic.
+Include variations like tutorials, explanations, guides, examples, etc.`
+      }
+    ];
+
+    try {
+      const response = await azure_chat_completion(messages);
+            let queries: string[] = [];
+        try {
+        const match = response.match(/\[[\s\S]*\]/);
+        if (match) {
+            queries = JSON.parse(match[0]);
+        }
+        } catch (e) {
+        console.error("❌ Failed to parse queries from GPT:", e);
+        };
+      
+      // Add site:youtube.com to each query
+      return queries.map((query: string) => `${query} site:youtube.com`);
+    } catch (e) {
+      console.error(`❌ Query generation failed: ${e}`);
+      // Fallback queries
+      return [
+        `${subtopic} tutorial site:youtube.com`,
+        `${subtopic} explained site:youtube.com`,
+        `${topic} ${subtopic} guide site:youtube.com`,
+        `how to ${subtopic} site:youtube.com`,
+        `${subtopic} examples site:youtube.com`,
+        `${topic} ${subtopic} course site:youtube.com`
+      ];
+    }
+  }
+        async investigate_subtopic_video(subtopic: string, topic: string, intent: string, groundingReport: string): Promise<any | null> {
+        console.log(`🎯 Finding best YouTube video for: ${subtopic}`);
+        
+        const queries = await this.generate_search_queries(topic, subtopic);
+        if (!queries || queries.length === 0) {
+            console.warn(`⚠️ No queries generated for ${subtopic}`);
+            return null;
+        }
+
+        const videoResults = await Promise.all(
+            queries.map(query => this.search_single_query(query))
+        );
+
+        const allVideos = videoResults.flat();
+        if (allVideos.length === 0) {
+            console.warn(`⚠️ No YouTube videos found for ${subtopic}`);
+            return null;
+        }
+
+        // Use groundingReport here to select the best
+        const best = await this.select_best_video(allVideos, subtopic, topic, intent, groundingReport);
+        return best;
+        }
+// Inside the YouTubeSpiderAgent class
+
+async select_best_video(
+    allVideos: any[], // Array of video objects with metadata (title, url, views, etc.)
+    subtopic: string,
+    topic: string,
+    intent: string,
+    groundingReport: string // The comprehensive report for the subtopic from InfoSpiderAgent
+): Promise<any | null> {
+    console.log(`🎬 Selecting best video for subtopic: "${subtopic}"`);
+    console.log(`Total videos to consider: ${allVideos.length}`);
+
+    if (allVideos.length === 0) {
+        return null;
+    }
+
+    // Step 1: Process all videos in parallel to get their scores
+    const evaluatedVideos = await executeInParallel(
+        allVideos,
+        async (video) => await this.process_video(video, groundingReport, subtopic),
+        Settings.MAX_CONCURRENT_REQUESTS,
+        Settings.DELAY_BETWEEN_BATCH_FETCHES_MS
+    );
+
+    // Filter out any videos that failed processing or were irrelevant
+    const relevantVideos = evaluatedVideos.filter(
+        (result): result is NonNullable<typeof result> =>
+            result !== null && result.score >= 5 // Adjust score threshold as needed
+    );
+
+    if (relevantVideos.length === 0) {
+        console.warn(`⚠️ No relevant videos found after evaluation for "${subtopic}".`);
+        return null;
+    }
+
+    // Step 2: Sort by score (descending)
+    relevantVideos.sort((a, b) => b.score - a.score);
+
+    // Step 3: Implement selection logic
+    // You can choose the top video, or apply more complex logic
+    // For example, prioritize videos with transcripts and high scores
+
+    const bestVideoResult = relevantVideos[0]; // Simplest: pick the highest-scoring video
+
+    console.log(`✅ Best video selected for "${subtopic}": ${bestVideoResult.video.title}`);
+    console.log(`   Score: ${bestVideoResult.score}, Processing Type: ${bestVideoResult.processingType}`);
+    if (bestVideoResult.bestResult && bestVideoResult.bestResult.chunk) {
+        console.log(`   Best segment starts at: ${Math.floor(bestVideoResult.bestResult.chunk.startTime/60)}:${String(bestVideoResult.bestResult.chunk.startTime%60).padStart(2,'0')}`);
+    }
+
+    return bestVideoResult;
+}
+
+  async scrape_youtube_metadata(url: string): Promise<{
+    views: number;
+    duration: string;
+    channel: string;
+    uploadDate: string;
+    title: string;
+  }> {
+    try {
+      console.log(`🔍 Scraping metadata for: ${url}`);
+      
+      const response = await axios.get(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+      });
+
+      const $ = cheerio.load(response.data);
+      
+      // Extract JSON-LD data which contains structured info
+      let jsonLd = null;
+      $('script[type="application/ld+json"]').each((_, el) => {
+        try {
+          const data = JSON.parse($(el).html() || '{}');
+          if (data['@type'] === 'VideoObject') {
+            jsonLd = data;
+            return false; // break
+          }
+        } catch (e) {
+          // Continue to next script tag
+        }
+      });
+
+      // Try to extract from ytInitialData (YouTube's client-side data)
+      let ytData = null;
+      const scriptTags = $('script').toArray();
+      for (const script of scriptTags) {
+        const content = $(script).html() || '';
+        if (content.includes('var ytInitialData = ')) {
+          try {
+            const match = content.match(/var ytInitialData = ({.*?});/);
+            if (match) {
+              ytData = JSON.parse(match[1]);
+              break;
+            }
+          } catch (e) {
+            // Continue searching
+          }
+        }
+      }
+
+      // Extract metadata using multiple fallback methods
+      const metadata = {
+        views: this.extractViews($, jsonLd, ytData),
+        duration: this.extractDuration($, jsonLd, ytData),
+        channel: this.extractChannel($, jsonLd, ytData),
+        uploadDate: this.extractUploadDate($, jsonLd, ytData),
+        title: this.extractTitle($, jsonLd, ytData)
+      };
+
+      console.log(`✅ Scraped metadata - Views: ${metadata.views}, Duration: ${metadata.duration}, Channel: ${metadata.channel}`);
+      return metadata;
+
+    } catch (error) {
+      console.error(`❌ Failed to scrape YouTube metadata: ${error}`);
+      return {
+        views: 0,
+        duration: 'Unknown',
+        channel: 'Unknown Channel',
+        uploadDate: 'Unknown',
+        title: 'Unknown Title'
+      };
+    }
+  }
+
+  extractViews($: any, jsonLd: any, ytData: any): number {
+    // Try JSON-LD first
+    if (jsonLd && jsonLd.interactionStatistic) {
+      const viewStat = jsonLd.interactionStatistic.find((stat: any) => 
+        stat['@type'] === 'InteractionCounter' && stat.interactionType === 'http://schema.org/WatchAction'
+      );
+      if (viewStat && viewStat.userInteractionCount) {
+        return parseInt(viewStat.userInteractionCount) || 0;
+      }
+    }
+
+    // Try meta tags
+    const viewsContent = $('meta[itemprop="interactionCount"]').attr('content');
+    if (viewsContent) {
+      const match = viewsContent.match(/(\d+)/);
+      if (match) return parseInt(match[1]);
+    }
+
+    // Try text extraction from page
+    const viewsText = $('.view-count, .style-scope.ytd-video-view-count-renderer, [class*="view"]').first().text();
+    if (viewsText) {
+      return this.parseViews(viewsText);
+    }
+
+    return 0;
+  }
+
+  extractDuration($: any, jsonLd: any, ytData: any): string {
+    // Try JSON-LD
+    if (jsonLd && jsonLd.duration) {
+      return this.parseISO8601Duration(jsonLd.duration);
+    }
+
+    // Try meta tag
+    const duration = $('meta[itemprop="duration"]').attr('content');
+    if (duration) {
+      return this.parseISO8601Duration(duration);
+    }
+
+    // Try ytInitialData
+    if (ytData) {
+      try {
+        const videoDetails = ytData.videoDetails || ytData.contents?.videoDetails;
+        if (videoDetails && videoDetails.lengthSeconds) {
+          return this.secondsToTimeString(parseInt(videoDetails.lengthSeconds));
+        }
+      } catch (e) {
+        // Continue to fallback
+      }
+    }
+
+    return 'Unknown';
+  }
+
+  extractChannel($: any, jsonLd: any, ytData: any): string {
+    // Try JSON-LD
+    if (jsonLd && jsonLd.author) {
+      if (typeof jsonLd.author === 'string') return jsonLd.author;
+      if (jsonLd.author.name) return jsonLd.author.name;
+    }
+
+    // Try meta tag
+    const channelName = $('meta[itemprop="author"]').attr('content') || 
+                       $('link[itemprop="url"]').attr('href')?.split('/').pop();
+    if (channelName) return channelName;
+
+    // Try text extraction
+    const channelText = $('.ytd-channel-name, .style-scope.ytd-video-owner-renderer, [class*="channel"]').first().text().trim();
+    if (channelText) return channelText;
+
+    return 'Unknown Channel';
+  }
+
+  extractUploadDate($: any, jsonLd: any, ytData: any): string {
+    // Try JSON-LD
+    if (jsonLd && jsonLd.uploadDate) {
+      return new Date(jsonLd.uploadDate).toLocaleDateString();
+    }
+
+    // Try meta tag
+    const uploadDate = $('meta[itemprop="uploadDate"]').attr('content');
+    if (uploadDate) {
+      return new Date(uploadDate).toLocaleDateString();
+    }
+
+    return 'Unknown';
+  }
+
+  extractTitle($: any, jsonLd: any, ytData: any): string {
+    // Try JSON-LD
+    if (jsonLd && jsonLd.name) return jsonLd.name;
+
+    // Try meta tags
+    const title = $('meta[property="og:title"]').attr('content') || 
+                 $('meta[name="title"]').attr('content') ||
+                 $('title').text();
+    
+    return title || 'Unknown Title';
+  }
+
+  parseISO8601Duration(duration: string): string {
+    const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+    if (!match) return duration;
+    
+    const hours = parseInt(match[1] || '0');
+    const minutes = parseInt(match[2] || '0');
+    const seconds = parseInt(match[3] || '0');
+    
+    if (hours > 0) {
+      return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+    } else {
+      return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    }
+  }
+
+  secondsToTimeString(totalSeconds: number): string {
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    
+    if (hours > 0) {
+      return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+    } else {
+      return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+    }
+  }
+
+  async search_single_query(query: string): Promise<any[]> {
+    console.log(`🔍 Searching: ${query}`);
+    
+    try {
+      const results = await search(query, { 
+        page: 1, 
+        safe: false, 
+        additional_params: { gl: 'us', hl: 'en' } 
+      });
+
+      const basicVideos = results.results
+        .filter(v => v.url && v.url.includes('youtube.com/watch'))
+        .map(v => ({
+          title: v.title || '',
+          url: v.url,
+          snippet: v.description || '',
+          query: query
+        }));
+
+      console.log(`📺 Query "${query}" found ${basicVideos.length} basic results, now scraping metadata...`);
+
+      // Scrape metadata for each video (in batches to avoid overwhelming)
+      const batchSize = 3;
+      const enrichedVideos = [];
+
+      for (let i = 0; i < basicVideos.length; i += batchSize) {
+        const batch = basicVideos.slice(i, i + batchSize);
+        
+        const batchPromises = batch.map(async (video) => {
+          const metadata = await this.scrape_youtube_metadata(video.url);
+          return {
+            ...video,
+            title: metadata.title !== 'Unknown Title' ? metadata.title : video.title,
+            views: metadata.views,
+            duration: metadata.duration,
+            channel: metadata.channel,
+            uploaded: metadata.uploadDate
+          };
+        });
+
+        const batchResults = await Promise.all(batchPromises);
+        enrichedVideos.push(...batchResults);
+
+        // Small delay between batches to be respectful
+        if (i + batchSize < basicVideos.length) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
+
+      console.log(`✅ Enriched ${enrichedVideos.length} videos with metadata`);
+      return enrichedVideos;
+
+    } catch (e) {
+      console.error(`❌ Search failed for query "${query}": ${e}`);
+      return [];
+    }
+  }
+
+  parseViews(viewsStr: string | number): number {
+    if (typeof viewsStr === 'number') return viewsStr;
+    if (!viewsStr) return 0;
+    
+    const str = viewsStr.toString().toLowerCase().replace(/[^0-9.kmb]/g, '');
+    const num = parseFloat(str);
+    
+    if (str.includes('k')) return Math.floor(num * 1000);
+    if (str.includes('m')) return Math.floor(num * 1000000);
+    if (str.includes('b')) return Math.floor(num * 1000000000);
+    
+    return Math.floor(num) || 0;
+  }
+
+  async search_youtube_videos_parallel(topic: string, subtopic: string): Promise<any[]> {
+    console.log(`🚀 Starting parallel YouTube search for: ${topic} - ${subtopic}`);
+    
+    const queries = await this.generate_search_queries(topic, subtopic);
+    console.log(`📝 Generated ${queries.length} search queries`);
+
+    const searchPromises = queries.map(query => this.search_single_query(query));
+    const searchResults = await Promise.all(searchPromises);
+
+    const allVideos = searchResults.flat();
+    const uniqueVideos = allVideos.filter((video, index, self) => 
+      index === self.findIndex(v => v.url === video.url)
+    );
+
+    // Sort by views but keep variety
+    const sortedVideos = uniqueVideos.sort((a, b) => (b.views || 0) - (a.views || 0));
+
+    console.log(`🎯 Found ${uniqueVideos.length} unique videos from ${allVideos.length} total results`);
+    return sortedVideos;
+  }
+
+  async check_transcript_availability(videoId: string): Promise<boolean> {
+    const transcriptUrl = `https://video.google.com/timedtext?lang=en&v=${videoId}`;
+    try {
+      const response = await axios.head(transcriptUrl);
+      return response.status === 200;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  async get_transcript(videoId: string): Promise<{ text: string; timestamps: number[] } | null> {
+    const transcriptUrl = `https://video.google.com/timedtext?lang=en&v=${videoId}`;
+    try {
+      const response = await axios.get(transcriptUrl);
+      const $ = cheerio.load(response.data, { xmlMode: true });
+
+      const segments: { text: string; start: number }[] = [];
+      
+      $('text').each((_, el) => {
+        const text = $(el).text();
+        const start = parseFloat($(el).attr('start') || '0');
+        if (text.trim()) {
+          segments.push({ text: text.trim(), start });
+        }
+      });
+
+      if (segments.length === 0) return null;
+
+      const fullText = segments.map(s => s.text).join(' ');
+      const timestamps = segments.map(s => s.start);
+
+      return {
+        text: fullText.replace(/\s+/g, ' ').trim(),
+        timestamps
+      };
+    } catch (error) {
+      console.error(`❌ Failed to fetch transcript for ${videoId}: ${error}`);
+      return null;
+    }
+  }
+
+  chunk_transcript_with_timestamps(transcript: { text: string; timestamps: number[] }, maxWords: number = 300): Array<{ text: string; startTime: number; endTime: number; chunkIndex: number }> {
+    const words = transcript.text.split(' ');
+    const chunks: Array<{ text: string; startTime: number; endTime: number; chunkIndex: number }> = [];
+    
+    for (let i = 0; i < words.length; i += maxWords) {
+      const chunkWords = words.slice(i, i + maxWords);
+      const chunkText = chunkWords.join(' ');
+      
+      // Estimate timestamp based on word position
+      const wordStartRatio = i / words.length;
+      const wordEndRatio = Math.min((i + maxWords) / words.length, 1);
+      
+      const startTime = Math.floor(wordStartRatio * (transcript.timestamps[transcript.timestamps.length - 1] || 0));
+      const endTime = Math.floor(wordEndRatio * (transcript.timestamps[transcript.timestamps.length - 1] || 0));
+      
+      if (chunkText.trim().length > 100) {
+        chunks.push({
+          text: chunkText,
+          startTime,
+          endTime,
+          chunkIndex: Math.floor(i / maxWords)
+        });
+      }
+    }
+    
+    return chunks;
+  }
+
+  async evaluate_transcript_chunks(chunks: Array<{ text: string; startTime: number; endTime: number; chunkIndex: number }>, report: string, subtopic: string): Promise<Array<{ score: number; chunk: any; reason: string }>> {
+    const batchSize = 5;
+    const results: Array<{ score: number; chunk: any; reason: string }> = [];
+
+    for (let i = 0; i < chunks.length; i += batchSize) {
+      const batch = chunks.slice(i, i + batchSize);
+      const batchPromises = batch.map(async (chunk) => {
+        const messages: ChatMessage[] = [
+          {
+            role: 'system',
+            content: `You are an educational content evaluator. Rate how well a YouTube transcript chunk teaches the given subtopic (0-10).
+Consider: clarity, depth, practical examples, step-by-step explanations.
+Score 8-10: Excellent teaching, clear explanations
+Score 6-7: Good content, somewhat helpful  
+Score 4-5: Basic coverage, limited value
+Score 0-3: Irrelevant or poor quality
+Output JSON: { "score": number, "reason": "specific reason why this score" }`
+          },
+          {
+            role: 'user',
+            content: `Subtopic to learn: ${subtopic}
+
+Reference context:
+${report.substring(0, 800)}...
+
+Video transcript chunk (${Math.floor(chunk.startTime/60)}:${String(chunk.startTime%60).padStart(2,'0')} - ${Math.floor(chunk.endTime/60)}:${String(chunk.endTime%60).padStart(2,'0')}):
+${chunk.text}`
+          }
+        ];
+
+        try {
+          const response = await azure_chat_completion(messages);
+          const parsed = JSON.parse(response.match(/\{.*\}/)?.[0] || '{}');
+          return { 
+            score: parsed.score || 0, 
+            chunk,
+            reason: parsed.reason || 'No reason provided'
+          };
+        } catch (e) {
+          console.error(`❌ Chunk evaluation failed`);
+          return { score: 0, chunk, reason: 'Evaluation failed' };
+        }
+      });
+
+      const batchResults = await Promise.all(batchPromises);
+      results.push(...batchResults);
+      
+      if (i + batchSize < chunks.length) {
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    }
+
+    return results;
+  }
+
+  async evaluate_video_metadata(video: any, subtopic: string, report: string): Promise<{ score: number; reason: string }> {
+    const messages: ChatMessage[] = [
+      {
+        role: 'system',
+        content: `You are evaluating a YouTube video's potential relevance based only on metadata (no transcript available).
+Rate 0-7 how likely this video teaches the subtopic well based on title, description, views, channel.
+Be conservative - metadata-only videos max out at 7/10.
+Output JSON: { "score": number, "reason": "why this score based on metadata" }`
+      },
+      {
+        role: 'user',
+        content: `Subtopic: ${subtopic}
+
+Video Metadata:
+Title: ${video.title}
+Description: ${video.snippet.substring(0, 300)}...
+Views: ${video.views}
+Channel: ${video.channel}
+Duration: ${video.duration}
+
+Context for comparison:
+${report.substring(0, 500)}...`
+      }
+    ];
+
+    try {
+      const response = await azure_chat_completion(messages);
+      const parsed = JSON.parse(response.match(/\{.*\}/)?.[0] || '{}');
+      return {
+        score: Math.min(parsed.score || 0, 7), // Cap metadata-only videos at 7
+        reason: parsed.reason || 'Metadata evaluation'
+      };
+    } catch (e) {
+      console.error(`❌ Metadata evaluation failed`);
+      return { score: 0, reason: 'Evaluation failed' };
+    }
+  }
+
+  async process_video(video: any, report: string, subtopic: string): Promise<{
+    video: any; 
+    hasTranscript: boolean;
+    bestResult?: any;
+    score: number;
+    reason: string;
+    processingType: 'transcript' | 'metadata';
+  }> {
+    const videoId = new URL(video.url).searchParams.get("v") || video.url.split('v=')[1]?.split('&')[0];
+    if (!videoId) {
+      return { video, hasTranscript: false, score: 0, reason: 'Invalid video ID', processingType: 'metadata' };
+    }
+
+    console.log(`🎬 Processing: ${video.title.substring(0, 50)}...`);
+
+    // First, check if transcript is available
+    const hasTranscript = await this.check_transcript_availability(videoId);
+    
+    if (hasTranscript) {
+      console.log(`📝 Transcript available - analyzing content...`);
+      
+      const transcript = await this.get_transcript(videoId);
+      if (!transcript) {
+        console.log(`❌ Failed to fetch transcript, falling back to metadata`);
+        const metadataResult = await this.evaluate_video_metadata(video, subtopic, report);
+        return {
+          video,
+          hasTranscript: false,
+          score: metadataResult.score,
+          reason: `Transcript fetch failed. ${metadataResult.reason}`,
+          processingType: 'metadata'
+        };
+      }
+
+      const chunks = this.chunk_transcript_with_timestamps(transcript, 300);
+      console.log(`📊 Analyzing ${chunks.length} transcript chunks...`);
+      
+      // For long videos (>20 chunks), sample chunks more strategically
+      const chunksToAnalyze = chunks.length > 20 ? 
+        this.sampleChunksStrategically(chunks, subtopic) : 
+        chunks;
+
+      const evaluated = await this.evaluate_transcript_chunks(chunksToAnalyze, report, subtopic);
+      const bestChunk = evaluated.sort((a, b) => b.score - a.score)[0];
+
+      if (bestChunk && bestChunk.score >= 6) {
+        return {
+          video,
+          hasTranscript: true,
+          bestResult: bestChunk,
+          score: bestChunk.score,
+          reason: `Transcript analysis: ${bestChunk.reason}. Best segment at ${Math.floor(bestChunk.chunk.startTime/60)}:${String(bestChunk.chunk.startTime%60).padStart(2,'0')}`,
+          processingType: 'transcript'
+        };
+      } else {
+        return {
+          video,
+          hasTranscript: true,
+          bestResult: bestChunk,
+          score: bestChunk?.score || 0,
+          reason: `Transcript available but content not highly relevant. ${bestChunk?.reason || 'No good matches found'}`,
+          processingType: 'transcript'
+        };
+      }
+    } else {
+      console.log(`📋 No transcript - evaluating metadata only...`);
+      const metadataResult = await this.evaluate_video_metadata(video, subtopic, report);
+      
+      return {
+        video,
+        hasTranscript: false,
+        score: metadataResult.score,
+        reason: `No transcript available. ${metadataResult.reason}`,
+        processingType: 'metadata'
+      };
+    }
+  }
+
+  sampleChunksStrategically(chunks: any[], subtopic: string): any[] {
+    // For long videos, sample chunks from beginning, middle, and end
+    // Plus any chunks that might contain the subtopic keywords
+    const subtopicWords = subtopic.toLowerCase().split(' ');
+    
+    const keywordChunks = chunks.filter(chunk => 
+      subtopicWords.some(word => chunk.text.toLowerCase().includes(word))
+    );
+    
+    const strategicChunks = [
+      ...chunks.slice(0, 3), // First 3 chunks
+      ...chunks.slice(Math.floor(chunks.length * 0.25), Math.floor(chunks.length * 0.25) + 2), // Quarter mark
+      ...chunks.slice(Math.floor(chunks.length * 0.5), Math.floor(chunks.length * 0.5) + 2), // Middle
+      ...chunks.slice(Math.floor(chunks.length * 0.75), Math.floor(chunks.length * 0.75) + 2), // Three-quarter mark
+      ...chunks.slice(-2), // Last 2 chunks
+      ...keywordChunks.slice(0, 5) // Top 5 keyword-matching chunks
+    ];
+
+    // Remove duplicates and limit to 15 chunks max
+    const uniqueChunks = strategicChunks.filter((chunk, index, self) => 
+      index === self.findIndex(c => c.chunkIndex === chunk.chunkIndex)
+    );
+
+    return uniqueChunks.slice(0, 15);
+  }
+
+  async find_best_youtube_video(topic: string, subtopic: string, report: string): Promise<{ videoUrl: string; timestamp?: number; reason: string }> {
+    console.log(`🎯 Finding best YouTube video for: ${topic} - ${subtopic}`);
+
+    const candidates = await this.search_youtube_videos_parallel(topic, subtopic);
+    
+    if (candidates.length === 0) {
+      return {
+        videoUrl: '',
+        reason: 'No YouTube videos found for the given topic and subtopic.'
+      };
+    }
+
+    console.log(`🚀 Processing ${Math.min(candidates.length, 12)} candidates in parallel batches...`);
+
+    // Process videos in parallel batches of 4 for speed while managing API limits
+    const topCandidates = candidates.slice(0, 12);
+    const batchSize = 4;
+    const allResults: any[] = [];
+
+    for (let i = 0; i < topCandidates.length; i += batchSize) {
+      const batch = topCandidates.slice(i, i + batchSize);
+      console.log(`⚡ Processing batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(topCandidates.length/batchSize)} (${batch.length} videos)...`);
+
+      // Process current batch in parallel
+      const batchPromises = batch.map(async (video, index) => {
+        const globalIndex = i + index + 1;
+        console.log(`🔍 [${globalIndex}] Starting: ${video.title.substring(0, 40)}...`);
+        
+        const result = await this.process_video(video, report, subtopic);
+        
+        console.log(`📊 [${globalIndex}] Complete: Score ${result.score}/10 (${result.processingType}) - ${result.hasTranscript ? 'Transcript' : 'Metadata'}`);
+        
+        return result;
+      });
+
+      const batchResults = await Promise.all(batchPromises);
+      allResults.push(...batchResults);
+
+      // Check for excellent matches after each batch - early termination
+      const excellentMatch = batchResults.find(r => r.hasTranscript && r.score >= 8);
+      if (excellentMatch) {
+        console.log(`🎉 EXCELLENT match found in batch! Score ${excellentMatch.score}/10 - stopping all processing`);
+        break;
+      }
+
+      // Check for good matches after 2 batches (8 videos)
+      if (i >= batchSize && allResults.some(r => r.hasTranscript && r.score >= 7)) {
+        const goodMatch = allResults.filter(r => r.hasTranscript && r.score >= 7)[0];
+        console.log(`✅ GOOD match found after ${allResults.length} videos! Score ${goodMatch.score}/10 - stopping processing`);
+        break;
+      }
+
+      // Small delay between batches to be nice to APIs
+      if (i + batchSize < topCandidates.length) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+
+    if (allResults.length === 0) {
+      return {
+        videoUrl: candidates[0]?.url || '',
+        reason: 'No videos could be processed successfully.'
+      };
+    }
+
+    console.log(`📈 Processed ${allResults.length} videos total. Selecting best match...`);
+
+    // Prioritize transcript-based videos over metadata-only videos
+    const transcriptVideos = allResults.filter(v => v.hasTranscript && v.score >= 6);
+    const metadataVideos = allResults.filter(v => !v.hasTranscript && v.score >= 5);
+
+    let bestVideo;
+    if (transcriptVideos.length > 0) {
+      bestVideo = transcriptVideos.sort((a, b) => b.score - a.score)[0];
+      console.log(`✅ Selected transcript-based video: "${bestVideo.video.title.substring(0, 50)}..." (Score: ${bestVideo.score}/10)`);
+    } else if (metadataVideos.length > 0) {
+      bestVideo = metadataVideos.sort((a, b) => b.score - a.score)[0];
+      console.log(`📋 Selected metadata-based video: "${bestVideo.video.title.substring(0, 50)}..." (Score: ${bestVideo.score}/10)`);
+    } else {
+      bestVideo = allResults.sort((a, b) => b.score - a.score)[0];
+      console.log(`🔄 Using best available video: "${bestVideo.video.title.substring(0, 50)}..." (Score: ${bestVideo.score}/10)`);
+    }
+
+    if (bestVideo.hasTranscript && bestVideo.bestResult && bestVideo.bestResult.chunk) {
+      const timestamp = bestVideo.bestResult.chunk.startTime;
+      return {
+        videoUrl: `${bestVideo.video.url}&t=${timestamp}s`,
+        timestamp,
+        reason: `Parallel search result: ${bestVideo.reason} | Video: "${bestVideo.video.title}" | Timestamp: ${Math.floor(timestamp/60)}:${String(timestamp%60).padStart(2,'0')}`
+      };
+    } else {
+      return {
+        videoUrl: bestVideo.video.url,
+        reason: `Parallel search result: ${bestVideo.reason} | Video: "${bestVideo.video.title}" | ${bestVideo.hasTranscript ? 'Has transcript but no strong matches' : 'No transcript available'}`
+      };
+    }
+  }
+}
+
+export { YouTubeSpiderAgent };
+
+// === MAIN ORCHESTRATOR ===
+const ytSpider = new YouTubeSpiderAgent();
+async function main() {
+    console.log(`\n${"=".repeat(80)}`);
+    console.log(`🎓 AI COURSE GENERATOR - FULLY PARALLEL MULTI-AGENT SYSTEM`);
+    console.log(`${"=".repeat(80)}`);
+    console.log(`Agents: Intent → SSR Foundation (Parallel) → Spider King → Info Spider (Parallel)`);
+    console.log(`${"=".repeat(80)}`);
+
+    const overallStartTime = Date.now();
+
+    try {
+        // STAGE 1: Intent Extraction
+        console.log(`\n⏱️  STAGE 1: Intent Extraction`);
+        const stageStartTime = Date.now();
+        
+        const intentAgent = new IntentExtractionAgent();
+        const extractedData = await intentAgent.extract_intent();
+        
+        if (!extractedData) {
+            console.log("❌ Intent extraction failed. Exiting.");
+            return;
+        }
+
+        const { topic, intent } = extractedData;
+        console.log(`✅ Stage 1 completed in ${Math.round((Date.now() - stageStartTime) / 1000)}s`);
+
+        // STAGE 2: SSR Foundation Building (Fully Parallel)
+        console.log(`\n⏱️  STAGE 2: SSR Foundation Building (Parallel Mode)`);
+        const stage2StartTime = Date.now();
+        
+        const ssrAgent = new SSRFoundationAgent();
+        const webOfTruth = await ssrAgent.build_topic_report(topic, intent);
+        
+        console.log(`✅ Stage 2 completed in ${Math.round((Date.now() - stage2StartTime) / 1000)}s`);
+        console.log("\n🌐 WEB OF TRUTH:\n");
+        console.log(webOfTruth);
+        console.log("\n" + "=".repeat(80) + "\n");
+
+        // STAGE 3: Spider King Subtopic Decomposition
+        console.log(`\n⏱️  STAGE 3: Spider King Subtopic Analysis`);
+        const stage3StartTime = Date.now();
+        
+        const spiderKing = new SpiderKing();
+        const subtopics = await spiderKing.identify_subtopics_from_web_of_truth(webOfTruth, topic, intent);
+
+        if (subtopics.length === 0) {
+            console.log("❌ No subtopics could be extracted. Exiting.");
+            return;
+        }
+        
+        console.log(`✅ Stage 3 completed in ${Math.round((Date.now() - stage3StartTime) / 1000)}s`);
+
+        // STAGE 4: Info Spider Deep Investigation (Fully Parallel)
+        console.log(`\n⏱️  STAGE 4: Info Spider Investigation (Full Parallel Mode)`);
+        const stage4StartTime = Date.now();
+        
+        const infoSpider = new InfoSpiderAgent();
+        const subtopicReports = await infoSpider.investigate_all_subtopics(subtopics, topic, intent);
+        
+        console.log(`✅ Stage 4 completed in ${Math.round((Date.now() - stage4StartTime) / 1000)}s`);
+        // STAGE 5: YouTube Spider Analysis
+        console.log(`\n⏱️  STAGE 5: YouTube Spider Analysis`);
+        const stage5StartTime = Date.now();
+
+        const ytSpider = new YouTubeSpiderAgent();
+        const ytVideos = await executeInParallel(
+        subtopicReports,
+        async (report) => {
+            await ytSpider.find_best_youtube_video(
+            topic,
+            report.subtopic,
+            report.report
+            );
+
+        }
+        );
+
+        console.log(`✅ Stage 5 completed in ${Math.round((Date.now() - stage5StartTime) / 1000)}s`);
+        // FINAL REPORT GENERATION
+        const totalTime = Math.round((Date.now() - overallStartTime) / 1000);
+        
+        console.log(`\n${"=".repeat(60)}`);
+        console.log(`📋 FINAL COURSE STRUCTURE`);
+        console.log(`${"=".repeat(60)}`);
+        console.log(`Topic: ${topic}`);
+        console.log(`Intent: ${intent}`);
+        console.log(`Total Subtopics: ${subtopicReports.length}`);
+        console.log(`Total Processing Time: ${totalTime} seconds`);
+        console.log(`${"=".repeat(60)}`);
+
+        subtopicReports.forEach((report, index) => {
+            console.log(`\n${index + 1}. ${report.subtopic}`);
+            console.log(`   Report Length: ${report.report.length} characters`);
+            console.log(`   ${report.report.substring(0, 150)}...`);
+        });
+
+        // Performance Summary
+        console.log(`\n${"=".repeat(60)}`);
+        console.log(`⚡ PERFORMANCE SUMMARY`);
+        console.log(`${"=".repeat(60)}`);
+        console.log(`Intent Extraction: Stage 1`);
+        console.log(`Foundation Building: Stage 2 (Parallel searches + parallel processing)`);
+        console.log(`Subtopic Analysis: Stage 3`);
+        console.log(`Deep Investigation: Stage 4 (Full parallel subtopic processing)`);
+        console.log(`Total Execution Time: ${totalTime} seconds`);
+        console.log(`Parallelization Level: Maximum`);
+        console.log(`${"=".repeat(60)}`);
+
+        // Token Usage Summary
+        console.log(`\n${"=".repeat(60)}`);
+        console.log(`📊 TOKEN USAGE SUMMARY`);
+        console.log(`${"=".repeat(60)}`);
+        console.log(`Total Prompt Tokens: ${total_prompt_tokens.toLocaleString()}`);
+        console.log(`Total Completion Tokens: ${total_completion_tokens.toLocaleString()}`);
+        console.log(`Total Tokens: ${(total_prompt_tokens + total_completion_tokens).toLocaleString()}`);
+        console.log(`Processing Efficiency: ${Math.round((total_prompt_tokens + total_completion_tokens) / totalTime)} tokens/second`);
+        console.log(`${"=".repeat(60)}`);
+
+        console.log(`\n✅ Course generation completed successfully with full parallelization!`);
+        console.log(`🚀 Generated comprehensive learning materials for: ${topic}`);
+        console.log(`⚡ Achieved maximum parallel processing efficiency`);
+
+    } catch (error) {
+        console.error(`❌ Fatal error in main orchestrator: ${error}`);
+        const totalTime = Math.round((Date.now() - overallStartTime) / 1000);
+        console.error(`💥 Failed after ${totalTime} seconds`);
+    }
+}
+
+// Enhanced error handling wrapper
+async function runWithErrorHandling() {
+    try {
+        await main();
+    } catch (error) {
+        console.error(`💥 Unhandled error: ${error}`);
+        console.error("🔧 This might be due to API rate limits, network issues, or configuration problems.");
+        console.error("💡 Try adjusting Settings.MAX_CONCURRENT_REQUESTS or delays if you're hitting rate limits.");
+    }
+}
+
+// Start the application with enhanced error handling
+if (require.main === module) {
+    runWithErrorHandling();
+}

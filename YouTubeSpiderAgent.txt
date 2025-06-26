@@ -1,0 +1,471 @@
+class YouTubeSpiderAgent {
+  async generate_search_queries(topic: string, subtopic: string): Promise<string[]> {
+    const messages: ChatMessage[] = [
+      {
+        role: 'system',
+        content: `You are a search query generator. Generate 5-6 diverse YouTube search queries for finding educational content.
+Output only a JSON array of strings, no other text.
+Make queries specific and varied to capture different angles of the topic.`
+      },
+      {
+        role: 'user',
+        content: `Topic: ${topic}
+Subtopic: ${subtopic}
+
+Generate 5-6 YouTube search queries that would find the best educational videos for this subtopic.
+Include variations like tutorials, explanations, guides, examples, etc.`
+      }
+    ];
+
+    try {
+      const response = await azure_chat_completion(messages);
+      const queries = JSON.parse(response.match(/\[.*\]/s)?.[0] || '[]');
+      
+      // Add site:youtube.com to each query
+      return queries.map((query: string) => `${query} site:youtube.com`);
+    } catch (e) {
+      console.error(`❌ Query generation failed: ${e}`);
+      // Fallback queries
+      return [
+        `${subtopic} tutorial site:youtube.com`,
+        `${subtopic} explained site:youtube.com`,
+        `${topic} ${subtopic} guide site:youtube.com`,
+        `how to ${subtopic} site:youtube.com`,
+        `${subtopic} examples site:youtube.com`,
+        `${topic} ${subtopic} course site:youtube.com`
+      ];
+    }
+  }
+
+  async search_single_query(query: string): Promise<any[]> {
+    console.log(`🔍 Searching: ${query}`);
+    
+    try {
+      const results = await search(query, { 
+        page: 1, 
+        safe: false, 
+        additional_params: { gl: 'us', hl: 'en' } 
+      });
+
+      const videos = results.results
+        .filter(v => v.url && v.url.includes('youtube.com/watch'))
+        .map(v => ({
+          title: v.title || '',
+          url: v.url,
+          snippet: v.description || '',
+          views: this.parseViews(v.views) || 0,
+          uploaded: v.date || '',
+          query: query,
+          duration: v.duration || '',
+          channel: v.channel || ''
+        }));
+
+      console.log(`📺 Query "${query}" found ${videos.length} results`);
+      return videos;
+    } catch (e) {
+      console.error(`❌ Search failed for query "${query}": ${e}`);
+      return [];
+    }
+  }
+
+  parseViews(viewsStr: string | number): number {
+    if (typeof viewsStr === 'number') return viewsStr;
+    if (!viewsStr) return 0;
+    
+    const str = viewsStr.toString().toLowerCase().replace(/[^0-9.kmb]/g, '');
+    const num = parseFloat(str);
+    
+    if (str.includes('k')) return Math.floor(num * 1000);
+    if (str.includes('m')) return Math.floor(num * 1000000);
+    if (str.includes('b')) return Math.floor(num * 1000000000);
+    
+    return Math.floor(num) || 0;
+  }
+
+  async search_youtube_videos_parallel(topic: string, subtopic: string): Promise<any[]> {
+    console.log(`🚀 Starting parallel YouTube search for: ${topic} - ${subtopic}`);
+    
+    const queries = await this.generate_search_queries(topic, subtopic);
+    console.log(`📝 Generated ${queries.length} search queries`);
+
+    const searchPromises = queries.map(query => this.search_single_query(query));
+    const searchResults = await Promise.all(searchPromises);
+
+    const allVideos = searchResults.flat();
+    const uniqueVideos = allVideos.filter((video, index, self) => 
+      index === self.findIndex(v => v.url === video.url)
+    );
+
+    // Sort by views but keep variety
+    const sortedVideos = uniqueVideos.sort((a, b) => (b.views || 0) - (a.views || 0));
+
+    console.log(`🎯 Found ${uniqueVideos.length} unique videos from ${allVideos.length} total results`);
+    return sortedVideos;
+  }
+
+  async check_transcript_availability(videoId: string): Promise<boolean> {
+    const transcriptUrl = `https://video.google.com/timedtext?lang=en&v=${videoId}`;
+    try {
+      const response = await axios.head(transcriptUrl);
+      return response.status === 200;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  async get_transcript(videoId: string): Promise<{ text: string; timestamps: number[] } | null> {
+    const transcriptUrl = `https://video.google.com/timedtext?lang=en&v=${videoId}`;
+    try {
+      const response = await axios.get(transcriptUrl);
+      const $ = cheerio.load(response.data, { xmlMode: true });
+
+      const segments: { text: string; start: number }[] = [];
+      
+      $('text').each((_, el) => {
+        const text = $(el).text();
+        const start = parseFloat($(el).attr('start') || '0');
+        if (text.trim()) {
+          segments.push({ text: text.trim(), start });
+        }
+      });
+
+      if (segments.length === 0) return null;
+
+      const fullText = segments.map(s => s.text).join(' ');
+      const timestamps = segments.map(s => s.start);
+
+      return {
+        text: fullText.replace(/\s+/g, ' ').trim(),
+        timestamps
+      };
+    } catch (error) {
+      console.error(`❌ Failed to fetch transcript for ${videoId}: ${error}`);
+      return null;
+    }
+  }
+
+  chunk_transcript_with_timestamps(transcript: { text: string; timestamps: number[] }, maxWords: number = 300): Array<{ text: string; startTime: number; endTime: number; chunkIndex: number }> {
+    const words = transcript.text.split(' ');
+    const chunks: Array<{ text: string; startTime: number; endTime: number; chunkIndex: number }> = [];
+    
+    for (let i = 0; i < words.length; i += maxWords) {
+      const chunkWords = words.slice(i, i + maxWords);
+      const chunkText = chunkWords.join(' ');
+      
+      // Estimate timestamp based on word position
+      const wordStartRatio = i / words.length;
+      const wordEndRatio = Math.min((i + maxWords) / words.length, 1);
+      
+      const startTime = Math.floor(wordStartRatio * (transcript.timestamps[transcript.timestamps.length - 1] || 0));
+      const endTime = Math.floor(wordEndRatio * (transcript.timestamps[transcript.timestamps.length - 1] || 0));
+      
+      if (chunkText.trim().length > 100) {
+        chunks.push({
+          text: chunkText,
+          startTime,
+          endTime,
+          chunkIndex: Math.floor(i / maxWords)
+        });
+      }
+    }
+    
+    return chunks;
+  }
+
+  async evaluate_transcript_chunks(chunks: Array<{ text: string; startTime: number; endTime: number; chunkIndex: number }>, report: string, subtopic: string): Promise<Array<{ score: number; chunk: any; reason: string }>> {
+    const batchSize = 5;
+    const results: Array<{ score: number; chunk: any; reason: string }> = [];
+
+    for (let i = 0; i < chunks.length; i += batchSize) {
+      const batch = chunks.slice(i, i + batchSize);
+      const batchPromises = batch.map(async (chunk) => {
+        const messages: ChatMessage[] = [
+          {
+            role: 'system',
+            content: `You are an educational content evaluator. Rate how well a YouTube transcript chunk teaches the given subtopic (0-10).
+Consider: clarity, depth, practical examples, step-by-step explanations.
+Score 8-10: Excellent teaching, clear explanations
+Score 6-7: Good content, somewhat helpful  
+Score 4-5: Basic coverage, limited value
+Score 0-3: Irrelevant or poor quality
+Output JSON: { "score": number, "reason": "specific reason why this score" }`
+          },
+          {
+            role: 'user',
+            content: `Subtopic to learn: ${subtopic}
+
+Reference context:
+${report.substring(0, 800)}...
+
+Video transcript chunk (${Math.floor(chunk.startTime/60)}:${String(chunk.startTime%60).padStart(2,'0')} - ${Math.floor(chunk.endTime/60)}:${String(chunk.endTime%60).padStart(2,'0')}):
+${chunk.text}`
+          }
+        ];
+
+        try {
+          const response = await azure_chat_completion(messages);
+          const parsed = JSON.parse(response.match(/\{.*\}/s)?.[0] || '{}');
+          return { 
+            score: parsed.score || 0, 
+            chunk,
+            reason: parsed.reason || 'No reason provided'
+          };
+        } catch (e) {
+          console.error(`❌ Chunk evaluation failed`);
+          return { score: 0, chunk, reason: 'Evaluation failed' };
+        }
+      });
+
+      const batchResults = await Promise.all(batchPromises);
+      results.push(...batchResults);
+      
+      if (i + batchSize < chunks.length) {
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    }
+
+    return results;
+  }
+
+  async evaluate_video_metadata(video: any, subtopic: string, report: string): Promise<{ score: number; reason: string }> {
+    const messages: ChatMessage[] = [
+      {
+        role: 'system',
+        content: `You are evaluating a YouTube video's potential relevance based only on metadata (no transcript available).
+Rate 0-7 how likely this video teaches the subtopic well based on title, description, views, channel.
+Be conservative - metadata-only videos max out at 7/10.
+Output JSON: { "score": number, "reason": "why this score based on metadata" }`
+      },
+      {
+        role: 'user',
+        content: `Subtopic: ${subtopic}
+
+Video Metadata:
+Title: ${video.title}
+Description: ${video.snippet.substring(0, 300)}...
+Views: ${video.views}
+Channel: ${video.channel}
+Duration: ${video.duration}
+
+Context for comparison:
+${report.substring(0, 500)}...`
+      }
+    ];
+
+    try {
+      const response = await azure_chat_completion(messages);
+      const parsed = JSON.parse(response.match(/\{.*\}/s)?.[0] || '{}');
+      return {
+        score: Math.min(parsed.score || 0, 7), // Cap metadata-only videos at 7
+        reason: parsed.reason || 'Metadata evaluation'
+      };
+    } catch (e) {
+      console.error(`❌ Metadata evaluation failed`);
+      return { score: 0, reason: 'Evaluation failed' };
+    }
+  }
+
+  async process_video(video: any, report: string, subtopic: string): Promise<{
+    video: any; 
+    hasTranscript: boolean;
+    bestResult?: any;
+    score: number;
+    reason: string;
+    processingType: 'transcript' | 'metadata';
+  }> {
+    const videoId = new URL(video.url).searchParams.get("v") || video.url.split('v=')[1]?.split('&')[0];
+    if (!videoId) {
+      return { video, hasTranscript: false, score: 0, reason: 'Invalid video ID', processingType: 'metadata' };
+    }
+
+    console.log(`🎬 Processing: ${video.title.substring(0, 50)}...`);
+
+    // First, check if transcript is available
+    const hasTranscript = await this.check_transcript_availability(videoId);
+    
+    if (hasTranscript) {
+      console.log(`📝 Transcript available - analyzing content...`);
+      
+      const transcript = await this.get_transcript(videoId);
+      if (!transcript) {
+        console.log(`❌ Failed to fetch transcript, falling back to metadata`);
+        const metadataResult = await this.evaluate_video_metadata(video, subtopic, report);
+        return {
+          video,
+          hasTranscript: false,
+          score: metadataResult.score,
+          reason: `Transcript fetch failed. ${metadataResult.reason}`,
+          processingType: 'metadata'
+        };
+      }
+
+      const chunks = this.chunk_transcript_with_timestamps(transcript, 300);
+      console.log(`📊 Analyzing ${chunks.length} transcript chunks...`);
+      
+      // For long videos (>20 chunks), sample chunks more strategically
+      const chunksToAnalyze = chunks.length > 20 ? 
+        this.sampleChunksStrategically(chunks, subtopic) : 
+        chunks;
+
+      const evaluated = await this.evaluate_transcript_chunks(chunksToAnalyze, report, subtopic);
+      const bestChunk = evaluated.sort((a, b) => b.score - a.score)[0];
+
+      if (bestChunk && bestChunk.score >= 6) {
+        return {
+          video,
+          hasTranscript: true,
+          bestResult: bestChunk,
+          score: bestChunk.score,
+          reason: `Transcript analysis: ${bestChunk.reason}. Best segment at ${Math.floor(bestChunk.chunk.startTime/60)}:${String(bestChunk.chunk.startTime%60).padStart(2,'0')}`,
+          processingType: 'transcript'
+        };
+      } else {
+        return {
+          video,
+          hasTranscript: true,
+          bestResult: bestChunk,
+          score: bestChunk?.score || 0,
+          reason: `Transcript available but content not highly relevant. ${bestChunk?.reason || 'No good matches found'}`,
+          processingType: 'transcript'
+        };
+      }
+    } else {
+      console.log(`📋 No transcript - evaluating metadata only...`);
+      const metadataResult = await this.evaluate_video_metadata(video, subtopic, report);
+      
+      return {
+        video,
+        hasTranscript: false,
+        score: metadataResult.score,
+        reason: `No transcript available. ${metadataResult.reason}`,
+        processingType: 'metadata'
+      };
+    }
+  }
+
+  sampleChunksStrategically(chunks: any[], subtopic: string): any[] {
+    // For long videos, sample chunks from beginning, middle, and end
+    // Plus any chunks that might contain the subtopic keywords
+    const subtopicWords = subtopic.toLowerCase().split(' ');
+    
+    const keywordChunks = chunks.filter(chunk => 
+      subtopicWords.some(word => chunk.text.toLowerCase().includes(word))
+    );
+    
+    const strategicChunks = [
+      ...chunks.slice(0, 3), // First 3 chunks
+      ...chunks.slice(Math.floor(chunks.length * 0.25), Math.floor(chunks.length * 0.25) + 2), // Quarter mark
+      ...chunks.slice(Math.floor(chunks.length * 0.5), Math.floor(chunks.length * 0.5) + 2), // Middle
+      ...chunks.slice(Math.floor(chunks.length * 0.75), Math.floor(chunks.length * 0.75) + 2), // Three-quarter mark
+      ...chunks.slice(-2), // Last 2 chunks
+      ...keywordChunks.slice(0, 5) // Top 5 keyword-matching chunks
+    ];
+
+    // Remove duplicates and limit to 15 chunks max
+    const uniqueChunks = strategicChunks.filter((chunk, index, self) => 
+      index === self.findIndex(c => c.chunkIndex === chunk.chunkIndex)
+    );
+
+    return uniqueChunks.slice(0, 15);
+  }
+
+  async find_best_youtube_video(topic: string, subtopic: string, report: string): Promise<{ videoUrl: string; timestamp?: number; reason: string }> {
+    console.log(`🎯 Finding best YouTube video for: ${topic} - ${subtopic}`);
+
+    const candidates = await this.search_youtube_videos_parallel(topic, subtopic);
+    
+    if (candidates.length === 0) {
+      return {
+        videoUrl: '',
+        reason: 'No YouTube videos found for the given topic and subtopic.'
+      };
+    }
+
+    console.log(`🚀 Processing ${Math.min(candidates.length, 12)} candidates in parallel batches...`);
+
+    // Process videos in parallel batches of 4 for speed while managing API limits
+    const topCandidates = candidates.slice(0, 12);
+    const batchSize = 4;
+    const allResults: any[] = [];
+
+    for (let i = 0; i < topCandidates.length; i += batchSize) {
+      const batch = topCandidates.slice(i, i + batchSize);
+      console.log(`⚡ Processing batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(topCandidates.length/batchSize)} (${batch.length} videos)...`);
+
+      // Process current batch in parallel
+      const batchPromises = batch.map(async (video, index) => {
+        const globalIndex = i + index + 1;
+        console.log(`🔍 [${globalIndex}] Starting: ${video.title.substring(0, 40)}...`);
+        
+        const result = await this.process_video(video, report, subtopic);
+        
+        console.log(`📊 [${globalIndex}] Complete: Score ${result.score}/10 (${result.processingType}) - ${result.hasTranscript ? 'Transcript' : 'Metadata'}`);
+        
+        return result;
+      });
+
+      const batchResults = await Promise.all(batchPromises);
+      allResults.push(...batchResults);
+
+      // Check for excellent matches after each batch - early termination
+      const excellentMatch = batchResults.find(r => r.hasTranscript && r.score >= 8);
+      if (excellentMatch) {
+        console.log(`🎉 EXCELLENT match found in batch! Score ${excellentMatch.score}/10 - stopping all processing`);
+        break;
+      }
+
+      // Check for good matches after 2 batches (8 videos)
+      if (i >= batchSize && allResults.some(r => r.hasTranscript && r.score >= 7)) {
+        const goodMatch = allResults.filter(r => r.hasTranscript && r.score >= 7)[0];
+        console.log(`✅ GOOD match found after ${allResults.length} videos! Score ${goodMatch.score}/10 - stopping processing`);
+        break;
+      }
+
+      // Small delay between batches to be nice to APIs
+      if (i + batchSize < topCandidates.length) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+    }
+
+    if (allResults.length === 0) {
+      return {
+        videoUrl: candidates[0]?.url || '',
+        reason: 'No videos could be processed successfully.'
+      };
+    }
+
+    console.log(`📈 Processed ${allResults.length} videos total. Selecting best match...`);
+
+    // Prioritize transcript-based videos over metadata-only videos
+    const transcriptVideos = allResults.filter(v => v.hasTranscript && v.score >= 6);
+    const metadataVideos = allResults.filter(v => !v.hasTranscript && v.score >= 5);
+
+    let bestVideo;
+    if (transcriptVideos.length > 0) {
+      bestVideo = transcriptVideos.sort((a, b) => b.score - a.score)[0];
+      console.log(`✅ Selected transcript-based video: "${bestVideo.video.title.substring(0, 50)}..." (Score: ${bestVideo.score}/10)`);
+    } else if (metadataVideos.length > 0) {
+      bestVideo = metadataVideos.sort((a, b) => b.score - a.score)[0];
+      console.log(`📋 Selected metadata-based video: "${bestVideo.video.title.substring(0, 50)}..." (Score: ${bestVideo.score}/10)`);
+    } else {
+      bestVideo = allResults.sort((a, b) => b.score - a.score)[0];
+      console.log(`🔄 Using best available video: "${bestVideo.video.title.substring(0, 50)}..." (Score: ${bestVideo.score}/10)`);
+    }
+
+    if (bestVideo.hasTranscript && bestVideo.bestResult && bestVideo.bestResult.chunk) {
+      const timestamp = bestVideo.bestResult.chunk.startTime;
+      return {
+        videoUrl: `${bestVideo.video.url}&t=${timestamp}s`,
+        timestamp,
+        reason: `Parallel search result: ${bestVideo.reason} | Video: "${bestVideo.video.title}" | Timestamp: ${Math.floor(timestamp/60)}:${String(timestamp%60).padStart(2,'0')}`
+      };
+    } else {
+      return {
+        videoUrl: bestVideo.video.url,
+        reason: `Parallel search result: ${bestVideo.reason} | Video: "${bestVideo.video.title}" | ${bestVideo.hasTranscript ? 'Has transcript but no strong matches' : 'No transcript available'}`
+      };
+    }
+  }
+}
+
+export { YouTubeSpiderAgent };

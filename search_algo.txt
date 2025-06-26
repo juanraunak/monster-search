@@ -1,0 +1,1101 @@
+import axios from 'axios';
+import * as cheerio from 'cheerio';
+import * as readline from 'readline';
+import { encode } from 'gpt-tokenizer';
+import { YouTube } from 'youtube-sr';
+
+// Load environment variables
+import * as dotenv from 'dotenv';
+dotenv.config();
+
+// === Configuration ===
+class Settings {
+    // API Keys - MOVE TO ENVIRONMENT VARIABLES
+    static readonly GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || "AIzaSyCk4DYKCm5sSLz63aFUlVk8E04QPSvjXT8";
+    static readonly GOOGLE_CX = process.env.GOOGLE_CX || "53459b243c2c34e0c";
+    static readonly YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY || "";
+    static readonly AZURE_OPENAI_API_KEY = process.env.AZURE_OPENAI_API_KEY || "";
+    static readonly AZURE_OPENAI_ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT || "";
+    static readonly AZURE_OPENAI_API_VERSION = process.env.AZURE_OPENAI_API_VERSION || "2024-06-01";
+    static readonly AZURE_OPENAI_DEPLOYMENT_ID = process.env.AZURE_OPENAI_DEPLOYMENT_ID || "gpt-4o";
+    
+    // Multi-Agent Settings
+    static readonly MAX_CONCURRENT_REQUESTS = 10;
+    static readonly MIN_SUBTOPICS = 10;
+    static readonly MAX_SUBTOPICS = 25;
+    static readonly COMPLETENESS_THRESHOLD = 0.95;
+    static readonly WEBSITES_PER_QUERY = 5;
+    static readonly FOUNDATION_QUERIES = 8;
+}
+
+// === Global Variables ===
+let total_prompt_tokens = 0;
+let total_completion_tokens = 0;
+
+// Headers for API calls
+const headers = {
+    "Content-Type": "application/json",
+    "api-key": Settings.AZURE_OPENAI_API_KEY
+};
+
+// === Types ===
+interface ChatMessage {
+    role: 'system' | 'user' | 'assistant';
+    content: string;
+}
+
+interface ExtractedData {
+    topic: string;
+    intent: string;
+}
+
+interface PageSummary {
+    url: string;
+    content: string;
+    tokens: number;
+    score: number;
+}
+
+interface VideoResult {
+    title: string;
+    url: string;
+    channel: string;
+    published: string;
+    match: number;
+    duration: number;
+}
+
+interface FoundationResult {
+    summaries: PageSummary[];
+    totalPages: number;
+    avgScore: number;
+}
+
+interface ResourceResult {
+    content: string;
+    url: string;
+    type: 'article' | 'video';
+    score: number;
+    title?: string;
+    channel?: string;
+    duration?: number;
+}
+
+interface SubtopicWithResource {
+    subtopic: string;
+    resource: ResourceResult;
+    learningObjectives: string[];
+    estimatedTime: number;
+    difficulty: number;
+    prerequisites: string[];
+}
+
+interface CourseStructure {
+    topic: string;
+    intent: string;
+    totalUnits: number;
+    estimatedHours: number;
+    units: SubtopicWithResource[];
+    completenessScore: number;
+    processingTime: number;
+}
+
+// === Utility Functions ===
+function count_tokens_from_messages(messages: ChatMessage[], model: string = "gpt-4o"): number {
+    const tokens_per_message = 3;
+    let num_tokens = 0;
+    for (const message of messages) {
+        num_tokens += tokens_per_message;
+        for (const value of Object.values(message)) {
+            num_tokens += encode(String(value)).length;
+        }
+    }
+    num_tokens += 3;
+    return num_tokens;
+}
+
+async function azure_chat_completion(messages: ChatMessage[]): Promise<string> {
+    const url = `${Settings.AZURE_OPENAI_ENDPOINT}/openai/deployments/${Settings.AZURE_OPENAI_DEPLOYMENT_ID}/chat/completions?api-version=${Settings.AZURE_OPENAI_API_VERSION}`;
+
+    const prompt_tokens = count_tokens_from_messages(messages, "gpt-4o");
+
+    try {
+        const response = await axios.post(url, {
+            messages: messages,
+            temperature: 0.7,
+            max_tokens: 4000
+        }, { headers });
+
+        const content = response.data.choices[0].message.content;
+        const completion_tokens = encode(content).length;
+
+        total_prompt_tokens += prompt_tokens;
+        total_completion_tokens += completion_tokens;
+
+        console.log(`📏 Tokens - Prompt: ${prompt_tokens} | Completion: ${completion_tokens}`);
+        return content;
+    } catch (error) {
+        console.error(`❌ Azure OpenAI API Error: ${error}`);
+        throw error;
+    }
+}
+
+async function executeInParallel<T, R>(
+    items: T[],
+    asyncFunction: (item: T) => Promise<R>,
+    concurrencyLimit: number = Settings.MAX_CONCURRENT_REQUESTS,
+    delayBetweenBatches: number = 1000 // milliseconds
+): Promise<R[]> {
+    const results: R[] = [];
+    let index = 0;
+
+    while (index < items.length) {
+        const batch = items.slice(index, index + concurrencyLimit);
+        await Promise.all(
+            batch.map((item, i) => asyncFunction(item).then((r) => {
+                results[index + i] = r;
+            }))
+        );
+        index += concurrencyLimit;
+
+        if (index < items.length) {
+            await new Promise((resolve) => setTimeout(resolve, delayBetweenBatches));
+        }
+    }
+
+    return results;
+}
+
+
+// === AGENT 1: Intent Extraction Agent ===
+class IntentExtractionAgent {
+    async extract_intent(): Promise<ExtractedData | null> {
+        console.log("\n" + "=".repeat(60));
+        console.log("🤖 AGENT 1: INTENT EXTRACTION");
+        console.log("=".repeat(60));
+        console.log("Define what you want to learn and your learning approach.");
+        console.log("Type 'exit' to stop.\n");
+
+        const system_prompt: ChatMessage = {
+            role: "system",
+            content: `You are an Intent Extraction Agent. Extract learning intent in this format:
+
+{
+  "topic": "specific subject to learn",
+  "intent": "learning approach and current level"
+}
+
+Rules:
+- Ask SHORT questions to clarify topic and intent
+- "topic" = specific subject (e.g., "piano", "Python programming", "data science")
+- "intent" = learning approach + current level (e.g., "complete beginner wanting to build web apps", "intermediate pianist wanting to play jazz")
+
+When both are clear, output JSON and say "Intent extracted. Starting research..."`
+        };
+
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
+
+        const askQuestion = (question: string): Promise<string> => {
+            return new Promise((resolve) => {
+                rl.question(question, (answer) => resolve(answer));
+            });
+        };
+
+        const messages: ChatMessage[] = [];
+        
+        try {
+            while (true) {
+                const prompt = await askQuestion("You: ");
+                if (prompt.toLowerCase() === "exit") {
+                    console.log("👋 Goodbye!");
+                    return null;
+                }
+
+                messages.push({ role: "user", content: prompt });
+                process.stdout.write("Agent: ");
+
+                const response = await azure_chat_completion([system_prompt, ...messages.slice(-10)]);
+                console.log(response);
+
+                messages.push({ role: "assistant", content: response });
+
+                // Extract JSON
+                if (response.includes("{") && response.includes("}")) {
+                    try {
+                        const start = response.indexOf("{");
+                        const end = response.indexOf("}", start) + 1;
+                        const json_str = response.substring(start, end);
+                        const extracted = JSON.parse(json_str);
+                        
+                        if (extracted && "topic" in extracted && "intent" in extracted) {
+                            console.log(`\n✅ Extracted: ${JSON.stringify(extracted)}`);
+                            return extracted;
+                        }
+                    } catch (e) {
+                        // Continue if JSON parsing fails
+                    }
+                }
+                console.log("\n");
+            }
+        } finally {
+            rl.close();
+        }
+        
+        return null;
+    }
+}
+
+// === AGENT 2: Foundation Builder Agent ===
+class FoundationBuilderAgent {
+    async google_search(query: string): Promise<string[]> {
+        console.log(`🔍 Searching: "${query}"`);
+        const url = `https://www.googleapis.com/customsearch/v1?key=${Settings.GOOGLE_API_KEY}&cx=${Settings.GOOGLE_CX}&q=${encodeURIComponent(query)}`;
+        
+        try {
+            const response = await axios.get(url);
+            const results = response.data.items || [];
+            return results.slice(0, Settings.WEBSITES_PER_QUERY).map((item: any) => item.link);
+        } catch (error) {
+            console.error(`❌ Search failed: ${error}`);
+            return [];
+        }
+    }
+
+    async fetch_and_clean_page(url: string): Promise<string> {
+        try {
+            console.log(`🌐 Fetching: ${url}`);
+            const response = await axios.get(url, { timeout: 10000 });
+            const $ = cheerio.load(response.data);
+            
+            // Remove unwanted elements
+            $('script, style, noscript, iframe, header, footer, nav').remove();
+            
+            const text = $('body').text()
+                .replace(/\s+/g, ' ')
+                .replace(/[^\w\s.,;:!?()-]/g, '')
+                .trim();
+            
+            return text.substring(0, 15000);
+        } catch (error) {
+            throw new Error(`Failed to fetch page: ${error}`);
+        }
+    }
+
+    async summarize_page(content: string, topic: string, intent: string): Promise<string> {
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `You are a Foundation Builder Agent. Create a focused summary (150-250 words) of content relevant to learning "${topic}" with intent "${intent}".
+
+Focus on:
+- Core concepts and fundamentals
+- Technical details and methods
+- Practical applications
+- Key insights and principles
+
+Ignore marketing, ads, and off-topic content. Return ONLY the summary.`
+            },
+            {
+                role: "user",
+                content: content.substring(0, 12000)
+            }
+        ];
+        
+        return await azure_chat_completion(messages);
+    }
+
+    async evaluate_relevance(summary: string, topic: string, intent: string): Promise<number> {
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `Rate this summary 1-10 for relevance to learning "${topic}" with intent "${intent}".
+
+Scoring criteria:
+- Topic coverage (0-4 points)
+- Intent alignment (0-3 points)  
+- Learning value (0-3 points)
+
+Return ONLY the number.`
+            },
+            {
+                role: "user",
+                content: summary.substring(0, 2000)
+            }
+        ];
+        
+        const response = await azure_chat_completion(messages);
+        const score = parseInt(response);
+        return isNaN(score) ? 0 : Math.min(10, Math.max(0, score));
+    }
+
+    async generate_foundation_queries(topic: string, intent: string): Promise<string[]> {
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `Generate 8 diverse Google search queries to build comprehensive foundation knowledge about a topic.
+
+Each query should:
+- Target different aspects of the topic
+- Be 3-6 words long
+- Find high-quality educational content
+- Cover basics, fundamentals, applications, and advanced concepts
+
+Return ONLY the queries, one per line.`
+            },
+            {
+                role: "user",
+                content: `Topic: "${topic}"
+Learning Intent: "${intent}"`
+            }
+        ];
+        
+        const response = await azure_chat_completion(messages);
+        return response.split('\n')
+            .map(q => q.trim())
+            .filter(q => q.length > 0)
+            .slice(0, Settings.FOUNDATION_QUERIES);
+    }
+
+    async build_foundation(topic: string, intent: string): Promise<FoundationResult> {
+        console.log(`\n${"=".repeat(60)}`);
+        console.log(`🏗️ AGENT 2: FOUNDATION BUILDER`);
+        console.log(`${"=".repeat(60)}`);
+        
+        const queries = await this.generate_foundation_queries(topic, intent);
+        console.log(`📋 Generated ${queries.length} foundation queries`);
+        
+        const allSummaries: PageSummary[] = [];
+        let totalPages = 0;
+        
+        // Process all queries in parallel
+        const queryPromises = queries.map(async (query) => {
+            const urls = await this.google_search(query);
+            const queryResults: PageSummary[] = [];
+            
+            for (const url of urls) {
+                try {
+                    const content = await this.fetch_and_clean_page(url);
+                    const summary = await this.summarize_page(content, topic, intent);
+                    const tokens = encode(summary).length;
+                    const score = await this.evaluate_relevance(summary, topic, intent);
+                    
+                    console.log(`📊 Score: ${score}/10 - ${url}`);
+                    
+                    if (score >= 6) {
+                        queryResults.push({ url, content: summary, tokens, score });
+                    }
+                    totalPages++;
+                } catch (error) {
+                    console.log(`❌ Error processing: ${error}`);
+                }
+            }
+            
+            return queryResults;
+        });
+        
+        const queryResults = await executeInParallel(queryPromises, (promise) => promise);
+        
+        // Flatten results
+        for (const results of queryResults) {
+            allSummaries.push(...results);
+        }
+        
+        // Calculate average score
+        const avgScore = allSummaries.length > 0 ? 
+            allSummaries.reduce((sum, s) => sum + s.score, 0) / allSummaries.length : 0;
+        
+        console.log(`\n🏁 Foundation Complete!`);
+        console.log(`📚 Pages processed: ${totalPages}`);
+        console.log(`📝 Quality summaries: ${allSummaries.length}`);
+        console.log(`📈 Average score: ${avgScore.toFixed(1)}/10`);
+        
+        return {
+            summaries: allSummaries,
+            totalPages,
+            avgScore
+        };
+    }
+}
+
+// === AGENT 3: Deep Research Agent ===
+class DeepResearchAgent {
+    async extract_all_subtopics(
+        foundation: FoundationResult,
+        topic: string,
+        intent: string
+    ): Promise<string[]> {
+        console.log(`\n${"=".repeat(60)}`);
+        console.log(`🔬 AGENT 3: DEEP RESEARCH - SUBTOPIC EXTRACTION`);
+        console.log(`${"=".repeat(60)}`);
+        
+        const foundationContext = foundation.summaries
+            .map(s => s.content)
+            .join("\n\n")
+            .substring(0, 8000);
+        
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `You are a Deep Research Agent. Your mission is to extract EVERY possible subtopic from the foundation research to create the most comprehensive learning experience for "${topic}" with intent "${intent}".
+
+Analyze the foundation data and generate 15-25 specific subtopics that cover:
+- All fundamental concepts mentioned
+- All advanced topics discussed
+- All practical applications identified
+- All techniques and methods referenced
+- All tools and technologies mentioned
+- All theoretical foundations implied
+- All real-world use cases found
+
+Your goal: After learning these subtopics, the student should be a MASTER of "${topic}".
+
+Rules:
+- Each subtopic should be 2-5 words
+- Make them specific and actionable
+- Order from basic to advanced
+- No duplicates or overlaps
+- Focus on depth and completeness
+
+Return ONLY the subtopics, one per line, in learning order.`
+            },
+            {
+                role: "user",
+                content: `Topic: "${topic}"
+Learning Intent: "${intent}"
+
+Foundation Research:
+${foundationContext}`
+            }
+        ];
+        
+        const response = await azure_chat_completion(messages);
+        const subtopics = response.split('\n')
+            .map(s => s.trim())
+            .filter(s => s.length > 0)
+            .slice(0, Settings.MAX_SUBTOPICS);
+        
+        console.log(`📋 Extracted ${subtopics.length} comprehensive subtopics:`);
+        subtopics.forEach((subtopic, i) => {
+            console.log(`  ${i + 1}. ${subtopic}`);
+        });
+        
+        return subtopics;
+    }
+
+    async find_best_article(subtopic: string, topic: string, intent: string): Promise<ResourceResult | null> {
+        const query = `${subtopic} ${topic} tutorial guide explanation`;
+        const url = `https://www.googleapis.com/customsearch/v1?key=${Settings.GOOGLE_API_KEY}&cx=${Settings.GOOGLE_CX}&q=${encodeURIComponent(query)}`;
+        
+        try {
+            const response = await axios.get(url);
+            const results = response.data.items || [];
+            
+            for (const item of results.slice(0, 3)) {
+                try {
+                    const pageResponse = await axios.get(item.link, { timeout: 8000 });
+                    const $ = cheerio.load(pageResponse.data);
+                    $('script, style, noscript, iframe, header, footer, nav').remove();
+                    
+                    const content = $('body').text()
+                        .replace(/\s+/g, ' ')
+                        .trim()
+                        .substring(0, 12000);
+                    
+                    const summary = await this.summarize_resource(content, subtopic, topic, intent);
+                    const score = await this.evaluate_resource_relevance(summary, subtopic, intent);
+                    
+                    if (score >= 7) {
+                        return {
+                            content: summary,
+                            url: item.link,
+                            type: 'article',
+                            score: score,
+                            title: item.title
+                        };
+                    }
+                } catch (error) {
+                    continue;
+                }
+            }
+        } catch (error) {
+            console.log(`❌ Article search failed for ${subtopic}: ${error}`);
+        }
+        
+        return null;
+    }
+
+    async find_best_video(subtopic: string, topic: string): Promise<ResourceResult | null> {
+        const query = `${subtopic} ${topic}`;
+        console.log(`🎥 Searching YouTube: '${query}'`);
+        
+        try {
+            const results = await YouTube.search(query, { type: "video", limit: 10 });
+            
+            for (const video of results) {
+                if (!video.duration || video.duration < 180) continue;
+                
+                const title = video.title || '';
+                const topicScore = this.fuzzy_match(topic.toLowerCase(), title.toLowerCase());
+                const subtopicScore = this.fuzzy_match(subtopic.toLowerCase(), title.toLowerCase());
+                
+                let match = 1;
+                if (topicScore > 40 && subtopicScore > 60) match = 4;
+                else if (topicScore > 30 && subtopicScore > 40) match = 3;
+                else if (subtopicScore > 60) match = 3;
+                else if (topicScore > 50) match = 2;
+                
+                if (match >= 3) {
+                    const summary = `Video: ${title} by ${video.channel?.name}. Duration: ${Math.floor(video.duration / 60)} minutes. Covers ${subtopic} in the context of ${topic}.`;
+                    
+                    return {
+                        content: summary,
+                        url: video.url,
+                        type: 'video',
+                        score: match,
+                        title: title,
+                        channel: video.channel?.name,
+                        duration: video.duration
+                    };
+                }
+            }
+        } catch (error) {
+            console.log(`❌ Video search failed for ${subtopic}: ${error}`);
+        }
+        
+        return null;
+    }
+
+    fuzzy_match(str1: string, str2: string): number {
+        const words1 = str1.split(/\s+/);
+        const words2 = str2.split(/\s+/);
+        
+        let matches = 0;
+        for (const word1 of words1) {
+            for (const word2 of words2) {
+                if (word1 === word2 || word1.includes(word2) || word2.includes(word1)) {
+                    matches++;
+                    break;
+                }
+            }
+        }
+        
+        return Math.round((matches / Math.max(words1.length, words2.length)) * 100);
+    }
+
+    async summarize_resource(content: string, subtopic: string, topic: string, intent: string): Promise<string> {
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `Summarize this content (100-200 words) focusing on "${subtopic}" in the context of "${topic}" for someone with intent "${intent}".
+
+Extract:
+- Key concepts and definitions
+- Practical applications
+- Step-by-step processes
+- Important techniques
+- Common pitfalls or considerations
+
+Return ONLY the focused summary.`
+            },
+            {
+                role: "user",
+                content: content.substring(0, 10000)
+            }
+        ];
+        
+        return await azure_chat_completion(messages);
+    }
+
+    async evaluate_resource_relevance(summary: string, subtopic: string, intent: string): Promise<number> {
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `Rate this resource summary 1-10 for teaching "${subtopic}" to someone with intent "${intent}".
+
+Scoring:
+- Subtopic coverage (0-4)
+- Clarity and depth (0-3)
+- Practical value (0-3)
+
+Return ONLY the number.`
+            },
+            {
+                role: "user",
+                content: summary.substring(0, 1500)
+            }
+        ];
+        
+        const response = await azure_chat_completion(messages);
+        const score = parseInt(response);
+        return isNaN(score) ? 0 : Math.min(10, Math.max(0, score));
+    }
+
+    async generate_learning_objectives(subtopic: string, resource: ResourceResult, intent: string): Promise<string[]> {
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `Generate 2-4 specific learning objectives for "${subtopic}" based on the resource content and learning intent "${intent}".
+
+Each objective should:
+- Start with an action verb (understand, apply, create, analyze, etc.)
+- Be specific and measurable
+- Be achievable through the provided resource
+
+Return ONLY the objectives, one per line.`
+            },
+            {
+                role: "user",
+                content: `Subtopic: "${subtopic}"
+Resource Content: "${resource.content.substring(0, 1000)}"`
+            }
+        ];
+        
+        const response = await azure_chat_completion(messages);
+        return response.split('\n')
+            .map(obj => obj.trim())
+            .filter(obj => obj.length > 0);
+    }
+
+    async estimate_learning_time(subtopic: string, resource: ResourceResult): Promise<number> {
+        // Simple heuristic based on resource type and content length
+        if (resource.type === 'video' && resource.duration) {
+            return Math.ceil(resource.duration / 60) + 15; // Video time + 15min practice
+        } else {
+            const wordCount = resource.content.split(' ').length;
+            const readingTime = Math.ceil(wordCount / 200); // 200 words per minute
+            return readingTime + 20; // Reading time + 20min practice
+        }
+    }
+
+    async research_subtopics_with_resources(
+        subtopics: string[],
+        topic: string,
+        intent: string
+    ): Promise<SubtopicWithResource[]> {
+        console.log(`\n🎯 Finding best resources for ${subtopics.length} subtopics...`);
+        
+        const subtopicPromises = subtopics.map(async (subtopic, index) => {
+            console.log(`\n🔍 Processing (${index + 1}/${subtopics.length}): ${subtopic}`);
+            
+            // Search for both article and video in parallel
+            const [article, video] = await Promise.all([
+                this.find_best_article(subtopic, topic, intent),
+                this.find_best_video(subtopic, topic)
+            ]);
+            
+            // Choose the best resource
+            let bestResource: ResourceResult | null = null;
+            if (article && video) {
+                bestResource = article.score >= video.score ? article : video;
+            } else if (article) {
+                bestResource = article;
+            } else if (video) {
+                bestResource = video;
+            }
+            
+            if (!bestResource) {
+                console.log(`❌ No suitable resource found for: ${subtopic}`);
+                return null;
+            }
+            
+            console.log(`✅ Found ${bestResource.type} (score: ${bestResource.score}) for: ${subtopic}`);
+            
+            // Generate learning objectives and estimate time
+            const [objectives, estimatedTime] = await Promise.all([
+                this.generate_learning_objectives(subtopic, bestResource, intent),
+                this.estimate_learning_time(subtopic, bestResource)
+            ]);
+            
+            return {
+                subtopic,
+                resource: bestResource,
+                learningObjectives: objectives,
+                estimatedTime,
+                difficulty: index + 1, // Simple difficulty based on order
+                prerequisites: index > 0 ? [subtopics[index - 1]] : []
+            };
+        });
+        
+        // Execute in parallel with concurrency limit
+        const results = await executeInParallel(subtopicPromises, (promise) => promise);
+        
+        // Filter out null results
+        const successfulUnits = results.filter(unit => unit !== null) as SubtopicWithResource[];
+        
+        console.log(`\n📊 Successfully created ${successfulUnits.length}/${subtopics.length} learning units`);
+        
+        return successfulUnits;
+    }
+}
+
+// === AGENT 4: Course Architecture Agent ===
+class CourseArchitectureAgent {
+    async evaluate_course_completeness(
+        units: SubtopicWithResource[],
+        topic: string,
+        intent: string,
+        foundation: FoundationResult
+    ): Promise<number> {
+        const unitsContext = units.map(unit => 
+            `${unit.subtopic}: ${unit.resource.content.substring(0, 200)}`
+        ).join('\n\n');
+        
+        const foundationContext = foundation.summaries
+            .map(s => s.content)
+            .join('\n\n')
+            .substring(0, 2000);
+        
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `You are a Course Architecture Agent. Evaluate if this course completely covers "${topic}" for someone with intent "${intent}".
+
+Rate 0.0-1.0 (1.0 = perfectly complete) based on:
+- Foundation knowledge coverage (0-0.3)
+- Topic mastery potential (0-0.4)  
+- Intent satisfaction (0-0.2)
+- Learning progression (0-0.1)
+
+Return ONLY the decimal score (e.g., 0.92).`
+            },
+            {
+                role: "user",
+                content: `Topic: "${topic}"
+Intent: "${intent}"
+
+Foundation Research Summary:
+${foundationContext}
+
+Course Units:
+${unitsContext.substring(0, 3000)}`
+            }
+        ];
+        
+        const response = await azure_chat_completion(messages);
+        const score = parseFloat(response);
+        return isNaN(score) ? 0 : Math.min(1, Math.max(0, score));
+    }
+
+    async identify_missing_areas(
+        units: SubtopicWithResource[],
+        topic: string,
+        intent: string,
+        foundation: FoundationResult
+    ): Promise<string[]> {
+        const unitsContext = units.map(unit => unit.subtopic).join(', ');
+        const foundationContext = foundation.summaries
+            .map(s => s.content)
+            .join('\n\n')
+            .substring(0, 3000);
+        
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `Identify 2-5 missing subtopics needed to complete mastery of "${topic}" with intent "${intent}".
+
+Current course covers: ${unitsContext}
+
+Based on the foundation research, what essential areas are missing?
+
+Return ONLY the missing subtopics, one per line.`
+            },
+            {
+                role: "user",
+                content: `Foundation Research:
+${foundationContext}
+
+Current Course Units: ${unitsContext}`
+            }
+        ];
+        
+        const response = await azure_chat_completion(messages);
+        return response.split('\n')
+            .map(topic => topic.trim())
+            .filter(topic => topic.length > 0)
+            .slice(0, 5);
+    }
+
+    async build_complete_course(
+        units: SubtopicWithResource[],
+        topic: string,
+        intent: string,
+        foundation: FoundationResult,
+        deepResearchAgent: DeepResearchAgent
+    ): Promise<CourseStructure> {
+        console.log(`\n${"=".repeat(60)}`);
+        console.log(`🏛️ AGENT 4: COURSE ARCHITECTURE`);
+        console.log(`${"=".repeat(60)}`);
+        
+        let finalUnits = [...units];
+        let completenessScore = await this.evaluate_course_completeness(finalUnits, topic, intent, foundation);
+        
+        console.log(`📊 Initial completeness: ${(completenessScore * 100).toFixed(1)}%`);
+        
+        // If not complete enough, add missing areas
+        if (completenessScore < Settings.COMPLETENESS_THRESHOLD) {
+            console.log(`⚠️ Course needs improvement (target: ${Settings.COMPLETENESS_THRESHOLD * 100}%)`);
+            
+            const missingAreas = await this.identify_missing_areas(finalUnits, topic, intent, foundation);
+            
+            if (missingAreas.length > 0) {
+                console.log(`🧩 Adding ${missingAreas.length} missing areas:`);
+                missingAreas.forEach((area, i) => console.log(`  ${i + 1}. ${area}`));
+                
+                const additionalUnits = await deepResearchAgent.research_subtopics_with_resources(
+                    missingAreas,
+                    topic,
+                    intent
+                );
+                
+                finalUnits.push(...additionalUnits);
+                completenessScore = await this.evaluate_course_completeness(finalUnits, topic, intent, foundation);
+                
+                console.log(`📈 Updated completeness: ${(completenessScore * 100).toFixed(1)}%`);
+            }
+        }
+        
+        const totalHours = finalUnits.reduce((sum, unit) => sum + unit.estimatedTime, 0) / 60;
+        
+        const courseStructure: CourseStructure = {
+            topic,
+            intent,
+            totalUnits: finalUnits.length,
+            estimatedHours: Math.ceil(totalHours),
+            units: finalUnits,
+            completenessScore,
+            processingTime: Date.now()
+        };
+        
+        console.log(`\n🎓 Course Architecture Complete!`);
+        console.log(`📚 Total Units: ${finalUnits.length}`);
+        console.log(`⏱️ Estimated Hours: ${Math.ceil(totalHours)}`);
+        console.log(`🎯 Completeness: ${(completenessScore * 100).toFixed(1)}%`);
+        
+        return courseStructure;
+    }
+}
+
+
+// === ADDED: Spider-Scan-Reason Foundation Agent ===
+class SSRFoundationAgent {
+    async build_topic_report(topic: string, intent: string): Promise<string> {
+        console.log(`\n${"=".repeat(60)}`);
+        console.log(`🕷️ SSR AGENT: BUILDING WEB OF TRUTH`);
+        console.log(`${"=".repeat(60)}`);
+
+        const queries = (await new FoundationBuilderAgent().generate_foundation_queries(topic, intent)).slice(0, 3);
+        console.log(`🔍 Generated ${queries.length} focused queries`);
+
+        const summaries: string[] = [];
+
+        for (const query of queries) {
+            const urls = await new FoundationBuilderAgent().google_search(query);
+            for (const url of urls) {
+                try {
+                    const content = await new FoundationBuilderAgent().fetch_and_clean_page(url);
+                    const summary = await new FoundationBuilderAgent().summarize_page(content, topic, intent);
+                    summaries.push(summary);
+                } catch (err) {
+                    console.log(`❌ Failed SSR URL: ${url}`);
+                }
+            }
+        }
+
+        const combined = summaries.join("\n\n").substring(0, 12000);
+
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `You are an autonomous research agent. Your task is to gather and synthesize dense factual knowledge on the topic: "${topic}" with intent: "${intent}". Structure the report to include clearly separated ideas, definitions, techniques, problems, methods, applications, and relationships. DO NOT write for human readability — write for another AI agent to understand and reason from. No intro, no fluff. Use bullet points or sections if needed.`
+
+            },
+            {
+                role: "user",
+                content: combined
+            }
+        ];
+
+        const finalReport = await azure_chat_completion(messages);
+        console.log(`✅ Final Web of Truth built.`);
+        return finalReport;
+    }
+}
+
+// === ADDED: Deep Subtopic Expansion Agent ===
+class SubtopicSpiderAgent {
+    async extract_and_explain_subtopics(report: string, topic: string, intent: string): Promise<{ title: string, summary: string }[]> {
+        console.log(`\n${"=".repeat(60)}`);
+        console.log(`🕷️ DEEP RESEARCH SPIDERS DEPLOYED`);
+        console.log(`${"=".repeat(60)}`);
+
+        const messages: ChatMessage[] = [
+            {
+                role: "system",
+                content: `Given the following topic research report, extract 15–25 specific subtopics. For each subtopic, explain in 150–200 words:
+
+- What the subtopic is
+- Why it matters
+- How it connects to the main topic and user intent
+
+Output format:
+Subtopic: <title>
+Summary: <summary>
+---`
+            },
+            {
+                role: "user",
+                content: `Topic: ${topic}\nIntent: ${intent}\n\n${report}`
+            }
+        ];
+
+        const response = await azure_chat_completion(messages);
+
+        const blocks = response.split("---").map(b => b.trim()).filter(Boolean);
+        const results = blocks.map(block => {
+            const match = block.match(/Subtopic:\s*(.+)\nSummary:\s*([\s\S]+)/);
+            return match ? { title: match[1].trim(), summary: match[2].trim() } : null;
+        }).filter(r => r !== null) as { title: string, summary: string }[];
+
+        console.log(`✅ Extracted ${results.length} detailed subtopics.`);
+        return results;
+    }
+}
+
+// === MERGED ORCHESTRATOR ===
+class CourseCreationOrchestrator {
+    private intentAgent = new IntentExtractionAgent();
+    private ssrAgent = new SSRFoundationAgent();
+    private subtopicAgent = new SubtopicSpiderAgent();
+
+    async create_complete_course(): Promise<any> {
+        const startTime = Date.now();
+
+        console.log("🚀 MULTI-AGENT COURSE CREATION SYSTEM");
+        console.log("=====================================");
+
+        try {
+            const extracted = await this.intentAgent.extract_intent();
+            if (!extracted) return null;
+
+            const report = await this.ssrAgent.build_topic_report(extracted.topic, extracted.intent);
+
+                // 🛑 Pause and show the Web of Truth
+                console.log(`\n🌐 WEB OF TRUTH REPORT:\n${"=".repeat(80)}\n`);
+                console.log(report);
+                console.log(`\n${"=".repeat(80)}`);
+
+                const rl = readline.createInterface({
+                    input: process.stdin,
+                    output: process.stdout
+                });
+
+                const userInput: string = await new Promise((resolve) => {
+                    rl.question('\n🕷️ Continue with subtopic spidering? (y/n): ', (answer) => {
+                        resolve(answer.trim().toLowerCase());
+                    });
+                });
+
+                rl.close();
+
+                if (userInput !== 'y' && userInput !== 'yes') {
+                    console.log('🚫 Spider deployment canceled.');
+                    return {
+                        topic: extracted.topic,
+                        intent: extracted.intent,
+                        foundation_report: report,
+                        subtopics: [],
+                        processingTime: (Date.now() - startTime) / 1000
+                    };
+                }
+
+            const subtopics = await this.subtopicAgent.extract_and_explain_subtopics(
+                report,
+                extracted.topic,
+                extracted.intent
+            );
+
+            console.log(`\n📘 SUBTOPIC REPORT`);
+            subtopics.forEach((s, i) => {
+                console.log(`\n${i + 1}. ${s.title}`);
+                console.log(s.summary);
+            });
+
+            const processingTime = (Date.now() - startTime) / 1000;
+            console.log(`\n⚡ Total Time: ${processingTime.toFixed(1)}s`);
+            const totalTokens = total_prompt_tokens + total_completion_tokens;
+            const estimatedCost = (total_prompt_tokens * 0.01 + total_completion_tokens * 0.03) / 1000;
+
+            console.log(`\n💰 TOKEN USAGE SUMMARY:`);
+            console.log(`📤 Prompt tokens: ${total_prompt_tokens.toLocaleString()}`);
+            console.log(`📥 Completion tokens: ${total_completion_tokens.toLocaleString()}`);
+            console.log(`🔢 Total tokens: ${totalTokens.toLocaleString()}`);
+            console.log(`💵 Estimated cost: $${estimatedCost.toFixed(2)}`);
+
+
+            return {
+                topic: extracted.topic,
+                intent: extracted.intent,
+                foundation_report: report,
+                subtopics,
+                processingTime
+            };
+        } catch (err) {
+            console.error(`❌ Course creation failed: ${err}`);
+            return null;
+        }
+    }
+}
+
+// === Entry Point ===
+async function main() {
+    const orchestrator = new CourseCreationOrchestrator();
+
+    try {
+        const course = await orchestrator.create_complete_course();
+
+        if (course) {
+            const rl = readline.createInterface({
+                input: process.stdin,
+                output: process.stdout
+            });
+
+            const exportPrompt = (): Promise<string> => {
+                return new Promise((resolve) => {
+                    rl.question('\n💾 Export course to JSON? (y/n): ', (answer) => {
+                        resolve(answer.toLowerCase());
+                    });
+                });
+            };
+
+            const shouldExport = await exportPrompt();
+            if (shouldExport === 'y' || shouldExport === 'yes') {
+                const fs = await import('fs/promises');
+                const filename = `course_${course.topic.replace(/\s+/g, '_').toLowerCase()}_${Date.now()}.json`;
+                await fs.writeFile(filename, JSON.stringify(course, null, 2));
+                console.log(`💾 Course exported to: ${filename}`);
+            }
+
+            rl.close();
+            console.log('\n✅ Course creation complete! 🎉');
+        } else {
+            console.log('\n❌ Course creation cancelled or failed.');
+        }
+
+    } catch (error) {
+        console.error(`❌ Fatal error: ${error}`);
+        process.exit(1);
+    }
+}
+
+if (require.main === module) {
+    main().catch(console.error);
+}
+
+export {
+    SSRFoundationAgent,
+    SubtopicSpiderAgent,
+    CourseCreationOrchestrator
+};
