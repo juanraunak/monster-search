@@ -13,9 +13,13 @@
   "dependencies": {
     "axios": "^1.10.0",
     "cheerio": "^1.1.0",
-    "dotenv": "^16.5.0",
+    "dotenv": "^16.6.1",
+    "fastify": "^5.4.0",
     "googlethis": "^1.8.0",
     "gpt-tokenizer": "^3.0.1",
+    "puppeteer": "^24.11.2",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "youtube-sr": "^4.3.11",
     "ytsr": "^3.8.4"
   },
