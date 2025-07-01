@@ -1136,132 +1136,213 @@ interface YouTubeVideoData {
 class YouTubeSpiderAgent {
 
   // NEW: Google scraping function for YouTube results
-  async scrapeGoogleYouTubeResults(query: string): Promise<YouTubeVideoData[]> {
-    console.log(`🔍 Scraping Google for YouTube results: "${query}"`);
-    
-    const searchUrl = `https://www.google.com/search?q=site:youtube.com+${encodeURIComponent(query)}`;
-    const videos: YouTubeVideoData[] = [];
+  // Fixed Google scraping function for YouTube results
+async scrapeGoogleYouTubeResults(query: string): Promise<YouTubeVideoData[]> {
+  console.log(`🔍 Scraping Google for YouTube results: "${query}"`);
+  
+  const searchUrl = `https://www.google.com/search?q=site%3Ayoutube.com+${encodeURIComponent(query)}&num=20`;
+  const videos: YouTubeVideoData[] = [];
 
-    try {
-      const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-      };
+  try {
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'Upgrade-Insecure-Requests': '1',
+      'DNT': '1',
+      'Connection': 'keep-alive'
+    };
 
-      const response = await axios.get(searchUrl, { headers, timeout: 15000 });
-      const $ = cheerio.load(response.data);
+    const response = await axios.get(searchUrl, { 
+      headers, 
+      timeout: 20000,
+      maxRedirects: 5,
+      validateStatus: (status) => status < 500 // Accept 4xx responses
+    });
 
-      // Find YouTube video links in Google search results
-      $('a[href*="youtube.com/watch"]').each((index, element) => {
-        if (videos.length >= 10) return false; // Limit to top 10 results
+    if (response.status !== 200) {
+      console.warn(`⚠️ Google returned status ${response.status}`);
+      return [];
+    }
+
+    const $ = cheerio.load(response.data);
+
+    // Multiple selectors to find YouTube links in different Google layouts
+    const linkSelectors = [
+      'a[href*="youtube.com/watch"]',
+      'a[href*="/url?q="][href*="youtube.com"]',
+      'a[href*="youtube.com"][href*="watch?v="]'
+    ];
+
+    const foundLinks = new Set<string>();
+
+    linkSelectors.forEach(selector => {
+      $(selector).each((index, element) => {
+        if (videos.length >= 15) return false; // Limit results
 
         const $link = $(element);
         const href = $link.attr('href');
         
         if (!href) return;
 
-        // Extract clean YouTube URL
         let videoUrl = '';
         let videoId = '';
         
-        if (href.startsWith('/url?q=')) {
-          // Google redirected URL
-          const urlMatch = href.match(/\/url\?q=([^&]+)/);
-          if (urlMatch) {
-            videoUrl = decodeURIComponent(urlMatch[1]);
+        try {
+          // Handle different URL formats
+          if (href.startsWith('/url?q=')) {
+            // Google redirect URL - extract the actual URL
+            const urlParams = new URLSearchParams(href.substring(6)); // Remove '/url?'
+            const actualUrl = urlParams.get('q');
+            if (actualUrl && actualUrl.includes('youtube.com/watch')) {
+              videoUrl = actualUrl;
+            }
+          } else if (href.includes('youtube.com/watch')) {
+            // Direct YouTube URL
+            if (href.startsWith('http')) {
+              videoUrl = href;
+            } else {
+              videoUrl = `https://www.youtube.com${href}`;
+            }
           }
-        } else if (href.includes('youtube.com/watch')) {
-          videoUrl = href;
-        }
 
-        if (!videoUrl) return;
+          if (!videoUrl || foundLinks.has(videoUrl)) return;
+          foundLinks.add(videoUrl);
 
-        // Extract video ID
-        const videoIdMatch = videoUrl.match(/[?&]v=([^&]+)/);
-        if (!videoIdMatch) return;
-        
-        videoId = videoIdMatch[1];
+          // Extract video ID
+          const url = new URL(videoUrl);
+          videoId = url.searchParams.get('v') || '';
+          
+          if (!videoId) return;
 
-        // Find the parent result container to extract title and snippet
-        const $result = $link.closest('div[data-ved]').length ? $link.closest('div[data-ved]') : $link.closest('.g');
-        
-        // Extract title - try multiple selectors
-        let title = '';
-        const $titleElement = $result.find('h3').first();
-        if ($titleElement.length) {
-          title = $titleElement.text().trim();
-        } else {
-          // Fallback: try to get from link text
-          title = $link.text().trim() || `Video ${videoId}`;
-        }
+          // Find the result container
+          const $container = $link.closest('[data-ved]');
+          const $fallbackContainer = $link.closest('.g, .tF2Cxc, .MjjYud');
+          const $result = $container.length ? $container : $fallbackContainer;
 
-        // Extract snippet/description
-        let snippet = '';
-        const $snippetElement = $result.find('[data-snf]').first();
-        if ($snippetElement.length) {
-          snippet = $snippetElement.text().trim();
-        } else {
-          // Fallback: look for description text
-          const $descElement = $result.find('span').filter((i, el) => {
-            const text = $(el).text();
-            return text.length > 50 && !text.includes('›') && !text.includes('•');
-          }).first();
-          snippet = $descElement.text().trim();
-        }
+          // Extract title with multiple fallback methods
+          let title = '';
+          
+          // Method 1: Look for h3 elements
+          const $h3 = $result.find('h3').first();
+          if ($h3.length) {
+            title = $h3.text().trim();
+          }
+          
+          // Method 2: Look for title in link text
+          if (!title) {
+            title = $link.text().trim();
+          }
+          
+          // Method 3: Look for title in nearby elements
+          if (!title) {
+            const $titleSpan = $result.find('span').filter((i, el) => {
+              const text = $(el).text().trim();
+              return text.length > 10 && text.length < 200 && !text.includes('•') && !text.includes('views');
+            }).first();
+            title = $titleSpan.text().trim();
+          }
 
-        // Try to extract channel name from URL or snippet
-        let channel = '';
-        const channelMatch = snippet.match(/([^•]+)(?:\s*•|\s*-|\s*\|)/);
-        if (channelMatch) {
-          channel = channelMatch[1].trim();
-        } else {
-          // Fallback: extract from URL if possible
-          const urlParts = videoUrl.split('/');
-          const channelIndex = urlParts.indexOf('channel') + 1;
-          if (channelIndex > 0 && channelIndex < urlParts.length) {
-            channel = urlParts[channelIndex];
+          // Clean up title
+          title = title
+            .replace(/^\s*-\s*YouTube\s*$/, '')
+            .replace(/\s*-\s*YouTube\s*$/, '')
+            .replace(/YouTube$/i, '')
+            .trim();
+
+          if (!title || title.length < 3) {
+            title = `YouTube Video ${videoId}`;
+          }
+
+          // Extract description/snippet
+          let snippet = '';
+          
+          // Look for description in various containers
+          const $descElements = $result.find('span, div').filter((i, el) => {
+            const text = $(el).text().trim();
+            return text.length > 30 && 
+                   text.length < 500 && 
+                   !text.includes('views') && 
+                   !text.includes('Subscribe') &&
+                   !text.match(/^\d+:\d+$/); // Not a timestamp
+          });
+
+          if ($descElements.length) {
+            snippet = $descElements.first().text().trim();
+          }
+
+          // Extract channel name from snippet or URL
+          let channel = 'Unknown Channel';
+          
+          // Try to extract from snippet pattern "ChannelName • views • time"
+          const channelMatch = snippet.match(/^([^•]+?)(?:\s*•|\s*-|\s*\|)/);
+          if (channelMatch && channelMatch[1].trim().length > 2) {
+            channel = channelMatch[1].trim();
           } else {
-            channel = 'Unknown Channel';
+            // Look for channel in separate elements
+            const $channelElement = $result.find('cite, .cite, span[class*="url"]').first();
+            if ($channelElement.length) {
+              const channelText = $channelElement.text();
+              const channelNameMatch = channelText.match(/youtube\.com\s*›\s*([^›]+)/);
+              if (channelNameMatch) {
+                channel = channelNameMatch[1].trim();
+              }
+            }
           }
+
+          const video: YouTubeVideoData = {
+            title: title,
+            url: videoUrl,
+            videoId: videoId,
+            duration: 'N/A', // Google doesn't provide duration consistently
+            views: 0, // Google doesn't provide accurate view counts
+            channel: channel,
+            channelUrl: `https://www.youtube.com/channel/${channel}`,
+            uploaded: '', // Google doesn't provide consistent upload dates
+            thumbnail: `https://img.youtube.com/vi/${videoId}/mqdefault.jpg`,
+            snippet: snippet || '',
+            query: query,
+            source: 'google'
+          };
+
+          videos.push(video);
+
+        } catch (error) {
+          console.warn(`⚠️ Error processing link ${href}:`, error);
+          return; // Continue to next link
         }
-
-        // Clean up title and snippet
-        title = title.replace(/^\s*-\s*YouTube\s*$/, '').trim();
-        if (!title || title === 'YouTube') {
-          title = snippet.split('.')[0] || `Video ${videoId}`;
-        }
-
-        const video: YouTubeVideoData = {
-          title: title || `YouTube Video ${videoId}`,
-          url: videoUrl,
-          videoId: videoId,
-          duration: 'N/A', // Google doesn't provide duration
-          views: 0, // Google doesn't provide view count
-          channel: channel,
-          channelUrl: `https://www.youtube.com/channel/${channel}`,
-          uploaded: '', // Google doesn't provide upload date
-          thumbnail: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
-          snippet: snippet || '',
-          query: query,
-          source: 'google'
-        };
-
-        videos.push(video);
       });
+    });
 
-      console.log(`✅ Google scraping complete: Found ${videos.length} YouTube videos`);
-      return videos;
+    // Remove duplicates based on video ID
+    const uniqueVideos = videos.filter((video, index, self) =>
+      index === self.findIndex(v => v.videoId === video.videoId)
+    );
 
-    } catch (error: any) {
-      console.error(`❌ Google scraping failed for "${query}":`, error.message);
-      return [];
+    console.log(`✅ Google scraping complete: Found ${uniqueVideos.length} unique YouTube videos`);
+    return uniqueVideos;
+
+  } catch (error: any) {
+    console.error(`❌ Google scraping failed for "${query}":`, error.message);
+    
+    // Log more specific error information
+    if (error.response) {
+      console.error(`Response status: ${error.response.status}`);
+      console.error(`Response headers:`, error.response.headers);
+    } else if (error.request) {
+      console.error(`No response received:`, error.code);
     }
+    
+    return [];
   }
+}
 
   // Updated to generate search queries from summary instead of full report
   async generate_search_queries_from_summary(topic: string, subtopic: string, summary: string): Promise<string[]> {
